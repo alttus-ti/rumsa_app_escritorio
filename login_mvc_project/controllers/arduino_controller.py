@@ -64,11 +64,60 @@ class ArduinoController:
         return None
     
     def enviar_linea(self, texto: str):
-        if self.serial_connection is None or not self.serial_connection.is_open:
+        conexion = self.serial_connection
+
+        if conexion is None or not conexion.is_open:
             raise RuntimeError("No hay conexion serial abierta.")
-        
-        print(f"[ARDUINO] TX: {texto.strip()}")
-        self.serial_connection.write((texto.strip() + "\n").encode("utf-8"))
+
+        texto = texto.strip()
+        payload = (texto + "\n").encode("utf-8")
+
+        if texto.startswith("al,") and len(payload) > 60:
+            if len(payload) > 96:
+                raise ValueError(
+                    "Comando de alta demasiado largo."
+                )
+
+            # Pedir que Arduino esté listo para recibir el alta larga.
+            conexion.write(b"preparar_alta24\n")
+
+            limite = time.monotonic() + 8.0
+            listo = False
+
+            while time.monotonic() < limite:
+                if not conexion.is_open:
+                    raise RuntimeError(
+                        "Se cerro la conexion con Arduino."
+                    )
+
+                if conexion.in_waiting:
+                    respuesta = conexion.readline().decode(
+                        "utf-8", errors="ignore"
+                    ).strip()
+
+                    print(f"[ARDUINO] RX: {respuesta}")
+
+                    if respuesta == "ALTA24_LISTO":
+                        listo = True
+                        break
+                else:
+                    time.sleep(0.01)
+
+            if not listo:
+                raise RuntimeError(
+                    "Arduino no confirmo ALTA24_LISTO. "
+                    "Carga el inicializador actualizado."
+                )
+
+        print(f"[ARDUINO] TX: {texto}")
+
+        enviados = conexion.write(payload)
+
+        if enviados != len(payload):
+            raise RuntimeError(
+                "El comando no se envio completo."
+            )
+
         return True
         
     

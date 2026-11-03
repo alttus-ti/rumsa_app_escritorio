@@ -1,13 +1,18 @@
+from ast import alias
 from pathlib import Path
-import shutil
+
+from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore import QCoreApplication, QDate, QDateTime, QSize, QTimer, Qt, QSettings, QRectF
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QCalendarWidget,
     QDialog,
     QFileDialog,
     QHeaderView,
+    QHBoxLayout,
+    QLabel,
     QMainWindow,
     QMessageBox,
     QTableWidget,
@@ -26,6 +31,7 @@ import traceback
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QBrush, QPainterPath, QDoubleValidator
 
 from core.sync_config import SYNC_INTERVAL_MS
+from core.date_picker import DatePicker
 from models.cancelar_model import CancelarModel
 from models.sustituir_model import SustituirModel
 
@@ -38,6 +44,7 @@ from models.recarga_model import RecargaModel
 from services.sync_service import SyncService
 from views.administrador_view import AdminWindow
 from views.dar_de_alta_view import AltaWindow
+from views.dar_de_alta_operador_view import Ui_AltaOWindow
 from views.login_view import LoginWindow
 from views.recarga_view import RecargaWindow
 from views.empleado_view import EmpleadoWindow
@@ -69,6 +76,7 @@ class AppController:
         self.tipo_actual = ""
         self.saldo_actual_centavos = 0
         self.monto_pendiente_centavos = 0
+        self._recarga_en_curso = None
         self.tarjeta_vencida = False
 
         # alta
@@ -81,6 +89,15 @@ class AppController:
 
         # sincronizacion
         self.sync_service = SyncService()
+        self._sync_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="desktop-sync",
+        )
+        self._sync_future = None
+        self._sync_poll = QTimer()
+        self._sync_poll.timeout.connect(
+            self._recibir_sincronizacion
+        )
         self.sync_timer = QTimer()
         self.sync_timer.timeout.connect(self._sincronizar_pendientes)
         self.sync_timer.start(SYNC_INTERVAL_MS)
@@ -89,6 +106,8 @@ class AppController:
         self.cancelar_model = CancelarModel()
         self.cancelar_timer = None
         self.uid_cancelar_actual = ""
+        self.tipo_cancelar_actual = ""
+        self.saldo_cancelar_actual = 0.0
         self.nombre_cancelar_actual = ""
         self.tarjeta_bloqueada = False
         
@@ -99,6 +118,7 @@ class AppController:
         self.uid_sustituir_nueva = ""
         self.tarjeta_sustituir_seleccionada = None
         self.resultados_sustituir = []
+        self.seccion_sustituir = "pasajeros"
         self.popup_resultados_sustituir = None
         self.sustituir_pendiente = None
         
@@ -136,11 +156,8 @@ class AppController:
         vigtarifa: str,
         vigencia12: str,
     ) -> str:
-        limite_serial_seguro = 60
-        prefijo = f"al,{uid},"
-        sufijo = f",{no_tarjeta},{id_tipo_tarjeta},{id_tarifa},{vigtarifa},{vigencia12}"
-        max_alias = max(1, limite_serial_seguro - len(prefijo) - len(sufijo))
-        return alias[:max_alias].strip()
+        # El nombre ocupa 24 bytes ASCII en las posiciones 40..63.
+        return self._limpiar_alias_para_arduino(alias, max_len=24)
 
     def _parsear_trama_saldo(self, linea: str):
         partes = linea.split(",")
@@ -152,7 +169,7 @@ class AppController:
         campos_nombre = partes[3:]
         tipo_fisico = ""
 
-        if len(campos_nombre) > 1 and campos_nombre[-1].strip().upper() in ("NO", "EU"):
+        if len(campos_nombre) > 1 and campos_nombre[-1].strip().upper() in ("NO", "EU", "KI", "DE"):
             tipo_fisico = campos_nombre[-1].strip().upper()
             campos_nombre = campos_nombre[:-1]
 
@@ -217,6 +234,8 @@ class AppController:
 
     def _configurar_login_window(self) -> None:
         ui = self.current_ui
+        ui.layoutEstructura10.addStretch(1)
+        ui.layoutEstructura10.setStretch(0, 1)
         self.login_controller = LoginController()
         
         ui.lineEditPassword.setEchoMode(QLineEdit.EchoMode.Password)
@@ -249,7 +268,7 @@ class AppController:
             return
 
         username = self.current_ui.lineEditUser.text().strip()
-        password = self.current_ui.lineEditPassword.text().strip()
+        password = self.current_ui.lineEditPassword.text()
 
         ok, message = self.login_controller.authenticate(username, password)
         if not ok:
@@ -291,10 +310,78 @@ class AppController:
         self.current_ui.setupUi(self.current_window)
         self._configurar_menu_usuario()
 
+        ui = self.current_ui
+        iconos_dir = Path(__file__).resolve().parent.parent / "assets" / "icons"
+        botones_iconos = (
+            (ui.botonusuario, "pasajeros"),
+            (ui.pushButton, "operadores"),
+            (ui.usuario, "pasajeros"),
+            (ui.botonalta, "alta"),
+            (ui.botonalta_2, "alta"),
+            (ui.botonsustituir, "sustituir"),
+            (ui.botonsustituir_2, "sustituir"),
+            (ui.botonrecarga, "recarga"),
+            (getattr(ui, "botonrecarga_2", None), "recarga"),
+            (ui.botoncancelar, "cancelar"),
+            (ui.botoncancelar_2, "cancelar"),
+        )
+        for boton, nombre_icono in botones_iconos:
+            if boton is None:
+                continue
+            icono = QIcon()
+            for modo in (QIcon.Mode.Normal, QIcon.Mode.Active):
+                icono.addFile(str(iconos_dir / f"{nombre_icono}.png"), QSize(), modo, QIcon.State.Off)
+                icono.addFile(str(iconos_dir / f"{nombre_icono}_selected.png"), QSize(), modo, QIcon.State.On)
+            boton.setIcon(icono)
+            boton.setIconSize(QSize(24, 24))
+            if nombre_icono in ("alta", "sustituir", "recarga", "cancelar"):
+                boton.setIconSize(QSize(36, 36))
+                boton.setText(" ".join(boton.text().split()).removesuffix(">").rstrip())
+                distribucion_flecha = QHBoxLayout(boton)
+                distribucion_flecha.setContentsMargins(0, 0, 20, 0)
+                distribucion_flecha.addStretch()
+                flecha = QLabel(">", boton)
+                flecha.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                flecha.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+                flecha.setProperty("uiRole", "arrow")
+                distribucion_flecha.addWidget(flecha)
+        ui.usuario.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+
+        for boton in (ui.botonusuario, ui.pushButton):
+            boton.setCheckable(True)
+        ui.grupo_menu = QButtonGroup(self.current_window)
+        ui.grupo_menu.setExclusive(True)
+        ui.grupo_menu.addButton(ui.botonusuario)
+        ui.grupo_menu.addButton(ui.pushButton)
+
+        def actualizar_seleccion_menu():
+            ui.botonusuario.setChecked(ui.stackedWidget.currentWidget() == ui.page_4)
+            ui.pushButton.setChecked(ui.stackedWidget.currentWidget() == ui.page_3)
+            seccion = "personal" if ui.stackedWidget.currentWidget() == ui.page_3 else "pasajeros"
+            self.settings.setValue(f"navegacion/{username}/seccion_menu", seccion)
+
+        seccion = self.settings.value(f"navegacion/{username}/seccion_menu", "pasajeros")
+        ui.stackedWidget.setCurrentWidget(ui.page_3 if seccion == "personal" else ui.page_4)
+        ui.stackedWidget.currentChanged.connect(actualizar_seleccion_menu)
+        actualizar_seleccion_menu()
+        ui.botonusuario.clicked.connect(
+            lambda: ui.stackedWidget.setCurrentWidget(ui.page_4)
+        )
+        ui.pushButton.clicked.connect(
+            lambda: ui.stackedWidget.setCurrentWidget(ui.page_3)
+        )
+
         self.current_ui.botonalta.clicked.connect(self.show_alta_window)
+        self.current_ui.botonalta_2.clicked.connect(self.show_alta_operador_window)
         self.current_ui.botonrecarga.clicked.connect(self.show_recarga_window)
         self.current_ui.botoncancelar.clicked.connect(self.show_cancelar_window)
-        self.current_ui.botonsustituir.clicked.connect(self.show_sustituir_window)
+        self.current_ui.botoncancelar_2.clicked.connect(self.show_cancelar_window)
+        self.current_ui.botonsustituir.clicked.connect(
+            lambda checked=False: self.show_sustituir_window(seccion="pasajeros")
+        )
+        self.current_ui.botonsustituir_2.clicked.connect(
+            lambda checked=False: self.show_sustituir_window(seccion="personal")
+        )
 
         self.current_window.show()
         self._close_replaced_window(previous_window)
@@ -307,6 +394,19 @@ class AppController:
         self.current_ui = EmpleadoWindow()
         self.current_ui.setupUi(self.current_window)
         self._configurar_menu_usuario()
+
+        boton = self.current_ui.botonrecarga
+        iconos_dir = Path(__file__).resolve().parent.parent / "assets" / "icons"
+        boton.setIcon(QIcon(str(iconos_dir / "recarga.png")))
+        boton.setIconSize(QSize(36, 36))
+        distribucion_flecha = QHBoxLayout(boton)
+        distribucion_flecha.setContentsMargins(0, 0, 20, 0)
+        distribucion_flecha.addStretch()
+        flecha = QLabel(">", boton)
+        flecha.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        flecha.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        flecha.setProperty("uiRole", "arrow")
+        distribucion_flecha.addWidget(flecha)
 
         self.current_ui.botonrecarga.clicked.connect(self.show_recarga_window)
 
@@ -325,6 +425,33 @@ class AppController:
         self._show_port_window(AltaWindow())
         self._configurar_alta_window()
 
+    def show_alta_operador_window(self) -> None:
+        self._show_port_window(Ui_AltaOWindow())
+        ui = self.current_ui
+        ui.labelEstadoConexion = ui.labelEstadoConexion_2
+        ui.curpstatus = QLabel(self.current_window)
+        ui.statusbar.addWidget(ui.curpstatus, 1)
+        ui.calendario = QCalendarWidget(self.current_window)
+        ui.calendario.hide()
+        ui.calendario_nacimiento = DatePicker(
+            ui.textofechanacimiento, self.current_window, "Seleccionar fecha de nacimiento"
+        )
+        ui.calendario_vigencia = DatePicker(
+            ui.textovigencia, self.current_window, "Seleccionar vigencia"
+        )
+        def sincronizar_vigencia():
+            fecha = QDate.fromString(ui.textovigencia.toPlainText(), "dd-MM-yyyy")
+            if fecha.isValid() and fecha != ui.calendario.selectedDate():
+                ui.calendario.setSelectedDate(fecha)
+
+        ui.textovigencia.textChanged.connect(sincronizar_vigencia)
+        ui.textofechanacimiento.clear()
+        ui.label_6.setText('<a href="quitar">Quitar foto</a>')
+        ui.label_6.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        ui.label_6.linkActivated.connect(self._limpiar_foto_alta)
+        ui.botonguardar_2.clicked.connect(self._cancelar_formulario_alta)
+        self._configurar_alta_window()
+
     def show_recarga_window(self) -> None:
         self._show_port_window(RecargaWindow())
         self._configurar_recarga_window()
@@ -333,7 +460,11 @@ class AppController:
         self._show_port_window(CancelarWindow())
         self._configurar_cancelar_window()
 
-    def show_sustituir_window(self) -> None:
+    def show_sustituir_window(self, seccion: str = "pasajeros") -> None:
+        seccion = seccion.strip().lower()
+        if seccion not in ("pasajeros", "personal"):
+            raise ValueError("Sección de búsqueda no válida.")
+        self.seccion_sustituir = seccion
         self._show_port_window(SustituirWindow())
         self._configurar_sustituir_window()
 
@@ -342,6 +473,7 @@ class AppController:
         self.current_window = QMainWindow()
         self.current_ui = ui
         self.current_ui.setupUi(self.current_window)
+        self._adaptar_controles_ui()
         
         self._configurar_menu_usuario()
 
@@ -349,65 +481,181 @@ class AppController:
 
         if hasattr(self.current_ui, "botonregresar"):
             self.current_ui.botonregresar.clicked.connect(
-                lambda: self.show_window_by_role(self.current_username, self.current_role)
+                self._regresar_pantalla_anterior
             )
+
+        ventana = self.current_window
+        ventana.closeEvent = lambda event: self._cerrar_pantalla_operacion(event, ventana)
 
         self.current_window.show()
         self._close_replaced_window(previous_window)
         self._actualizar_estado_sync_ui("connecting")
         QTimer.singleShot(300, self._sincronizar_pendientes)
 
+    def _regresar_pantalla_anterior(self) -> None:
+        if self.alta_pendiente or self._recarga_en_curso or self.sustituir_pendiente:
+            QMessageBox.warning(
+                self.current_window, "Operación en proceso",
+                "Espera a que la operación de la tarjeta se compruebe y se guarde antes de salir."
+            )
+            return
+        self.show_window_by_role(self.current_username, self.current_role)
+
+    def _cerrar_pantalla_operacion(self, event, ventana) -> None:
+        # Al reemplazar una ventana, su cierre no debe iniciar otro regreso.
+        if ventana is not self.current_window:
+            event.accept()
+            return
+        event.ignore()
+        self._regresar_pantalla_anterior()
+
+    def _adaptar_controles_ui(self) -> None:
+        """Conserva los enlaces del controlador al cambiar nombres en Designer."""
+        ui = self.current_ui
+        aliases = {
+            "labelEstadoConexion": "labelEstadoConexion_2",
+            "usuario": "usuario_2",
+        }
+        if isinstance(ui, AltaWindow):
+            aliases.update({
+                "textonombre": "textonombre_7", "textocurp": "textocurp_7",
+                "textofechanacimiento": "textofechanacimiento_7",
+                "textovigencia": "textovigencia_7", "fotoimagen": "fotoimagen_7",
+                "botonsubir": "botonsubir_7", "botonguardar": "botonguardar_14",
+                "mensajeInternet": "mensajeInternet_2",
+            })
+        for nombre, origen in aliases.items():
+            if not hasattr(ui, nombre) and hasattr(ui, origen):
+                setattr(ui, nombre, getattr(ui, origen))
+        if isinstance(ui, AltaWindow) and not hasattr(ui, "calendario"):
+            ui.calendario = QCalendarWidget(self.current_window)
+            ui.calendario.hide()
+            ui.calendario_nacimiento = DatePicker(
+                ui.textofechanacimiento, self.current_window, "Seleccionar fecha de nacimiento"
+            )
+            ui.calendario_vigencia = DatePicker(
+                ui.textovigencia, self.current_window, "Seleccionar vigencia"
+            )
+
+            def sincronizar_vigencia():
+                fecha = QDate.fromString(ui.textovigencia.toPlainText(), "dd-MM-yyyy")
+                if fecha.isValid() and fecha != ui.calendario.selectedDate():
+                    ui.calendario.setSelectedDate(fecha)
+
+            ui.textovigencia.textChanged.connect(sincronizar_vigencia)
+            ui.textofechanacimiento.clear()
+            ui.curpstatus = QLabel(self.current_window)
+            self.current_window.statusBar().addWidget(ui.curpstatus, 1)
+            ui.botonguardar_13.clicked.connect(self._cancelar_formulario_alta)
+            ui.label_34.setText('<a href="quitar">Quitar foto</a>')
+            ui.label_34.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+            ui.label_34.linkActivated.connect(self._limpiar_foto_alta)
+
     def _sincronizar_pendientes(self) -> None:
-        if isinstance(self.current_ui, LoginWindow):
+        if self._sync_future is not None:
             return
 
         pendientes = self.sync_service.count_pending()
-        if pendientes > 0:
-            self._actualizar_estado_sync_ui("syncing", pendientes)
 
-        resultado = self.sync_service.sync_pending_once()
+        if pendientes:
+            self._actualizar_estado_sync_ui(
+                "syncing",
+                pendientes,
+            )
+
+        self._sync_future = self._sync_executor.submit(
+            self.sync_service.sync_pending_once
+        )
+        self._sync_poll.start(100)
+
+    def _recibir_sincronizacion(self) -> None:
+        if (
+            self._sync_future is None
+            or not self._sync_future.done()
+        ):
+            return
+
+        self._sync_poll.stop()
+
+        try:
+            resultado = self._sync_future.result()
+
+        except Exception as error:
+            resultado = {
+                "state": "offline",
+                "pending_after": self.sync_service.count_pending(),
+                "message": str(error),
+            }
+
+        self._sync_future = None
+
+        if (
+            self.current_ui is not None
+            and hasattr(
+                self.current_ui,
+                "labelEstadoConexion",
+            )
+        ):
+            self.current_ui.labelEstadoConexion.setToolTip(
+                resultado.get("message", "")
+            )
+
         estado = resultado.get("state", "offline")
-        pendientes_restantes = int(resultado.get("pending_after", 0) or 0)
 
-        if estado == "connected":
-            self._actualizar_estado_sync_ui("connected", pendientes_restantes)
+        if estado not in {
+            "connected",
+            "connected_with_errors",
+        }:
+            estado = "offline"
+
+        self._actualizar_estado_sync_ui(
+            estado,
+            int(resultado.get("pending_after", 0) or 0),
+        )
+        if (resultado.get("synced_count", 0) > 0
+                and resultado.get("pending_after", 0) > 0
+                and resultado.get("error_count", 0) == 0):
+            QTimer.singleShot(0, self._sincronizar_pendientes)
+        
+        
+    def _actualizar_estado_sync_ui(
+        self, estado: str, pendientes: int = 0
+    ) -> None:
+        ui = self.current_ui
+
+        if ui is None or not hasattr(ui, "labelEstadoConexion"):
             return
 
-        if estado == "connected_with_errors":
-            self._actualizar_estado_sync_ui("connected_with_errors", pendientes_restantes)
-            return
-
-        self._actualizar_estado_sync_ui("offline", pendientes_restantes)
-
-    def _actualizar_estado_sync_ui(self, estado: str, pendientes: int = 0) -> None:
-        if self.current_ui is None or not hasattr(self.current_ui, "labelEstadoConexion"):
-            return
+        pendientes = max(0, int(pendientes or 0))
 
         if estado == "syncing":
-            texto = f"● Sincronizando ({pendientes})" if pendientes else "● Sincronizando"
-        elif estado == "connected":
-            texto = f"● Conectado · Pendientes: {pendientes}" if pendientes else "● Conectado"
+            texto = "Sincronizando" if pendientes else "Comprobando conexión"
+            color = "warning"
+
         elif estado == "connected_with_errors":
-            texto = f"● Conectado · Pendientes: {pendientes}" if pendientes else "● Conectado"
-        elif estado == "connecting":
-            texto = "● Conectando"
+            texto = "Conectado · Error de sincronización"
+            color = "warning"
+
+        elif estado == "connected":
+            texto = "Conectado"
+            color = "success"
+
         else:
-            texto = f"● Sin conexión · Pendientes: {pendientes}" if pendientes else "● Sin conexión"
+            texto = "Sin conexión"
+            color = "warning"
 
-        self.current_ui.labelEstadoConexion.setText(texto)
+        if pendientes:
+            texto += f" · Pendientes: {pendientes}"
 
-        if isinstance(self.current_ui, AltaWindow):
-            if estado == "offline":
-                self._mostrar_error_alta_sin_internet()
-            elif estado in ("connected", "connected_with_errors"):
-                self.current_ui.labelEstadoConexion.setStyleSheet("color: green; font-weight: bold;")
-                self._ocultar_error_alta_sin_internet()
-                self._set_alta_inputs_enabled(True)
-            else:
-                self.current_ui.labelEstadoConexion.setStyleSheet("color: #245E91; font-weight: bold;")
-                self._ocultar_error_alta_sin_internet()
-                self._set_alta_inputs_enabled(False)
+        ui.labelEstadoConexion.setText(texto)
+        ui.labelEstadoConexion.setProperty("estadoVisual", color)
 
+        if isinstance(ui, (AltaWindow, Ui_AltaOWindow)):
+            self._ocultar_error_alta_sin_internet()
+            self._set_alta_inputs_enabled(
+                not bool(self.alta_pendiente)
+            )
+    
     def _llenar_lista_puertos(self) -> None:
         alta_controller = AltaController()
         puertos = alta_controller.obtener_puertos_combo()
@@ -450,7 +698,7 @@ class AppController:
                 self.recarga_timer.stop()
             self.arduino.cerrar()
 
-        if isinstance(self.current_ui, AltaWindow):
+        if isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             if self.alta_timer is not None:
                 self.alta_timer.stop()
             self.arduino.cerrar()
@@ -498,8 +746,8 @@ class AppController:
         ui.texto4.setText("-")
         ui.texto5.setText("-")
         ui.texto6.setText("-")
-        ui.texto1.setText("0.00")
-        ui.texto2.setText("0.00")
+        ui.texto1.setText("$0.00")
+        ui.texto2.setText("$0.00")
         ui.texto7.setText("")
         ui.botonrecargar.setEnabled(True)
         
@@ -531,11 +779,8 @@ class AppController:
             self.recarga_timer.timeout.connect(self._leer_serial_recarga)
 
         self._conectar_puerto_recarga()
-        self.recarga_timer.start(300)
-        
-    
+        self.recarga_timer.start(300)   
    
-
     def _llenar_oficinas_recarga(self) -> None:
         ui = self.current_ui
         
@@ -552,8 +797,7 @@ class AppController:
         ]
         
         for oficina in oficinas:
-            ui.listaoficina.addItem(oficina, oficina)
-            
+            ui.listaoficina.addItem(oficina, oficina)         
     
     def _oficina_seleccionada_recarga(self) -> str:
         ui = self.current_ui
@@ -567,8 +811,7 @@ class AppController:
             oficina = ui.listaoficina.currentText()
         
         return str(oficina).strip()        
-        
-    
+         
     def _parsear_vigencia_tarjeta(self, vigencia_raw) -> Optional[datetime]:
         if vigencia_raw is None:
             return None
@@ -610,13 +853,13 @@ class AppController:
                 monto.clear()
                 monto.setEnabled(False)
 
-            ui.texto2.setText(f"{self.saldo_actual_centavos / 100:.2f}")
+            ui.texto2.setText(f"${self.saldo_actual_centavos / 100:.2f}")
             ui.botonrecargar.setEnabled(False)
             ui.texto7.setText(
                 "Tarjeta vencida "
                 f"({fecha_vigencia.strftime('%d-%m-%Y %H:%M:%S')})."
             )
-            ui.texto7.setStyleSheet("color: red; font-weight: bold;")
+            ui.texto7.setProperty("estadoVisual", "error")
             return
 
         if monto is not None and not getattr(self, "tarjeta_bloqueada", False):
@@ -627,19 +870,13 @@ class AppController:
 
         if "Tarjeta vencida" in ui.texto7.text():
             ui.texto7.setText("")
-            ui.texto7.setStyleSheet("")
-            
-            
-
+            ui.texto7.setProperty("estadoVisual", "")
+                      
     def _fallo_recarga(self, motivo: str, error: Optional[Exception] = None) -> None:
         if isinstance(self.current_ui, RecargaWindow):
             self.current_ui.texto7.setText("Fallo recarga")
             self.current_ui.texto7.setMaximumHeight(50)
-            self.current_ui.texto7.setStyleSheet("""
-                color: red;
-                font-size: 24px;
-                font-weight: bold;
-            """)
+            self.current_ui.texto7.setProperty("estadoVisual", "error")
             
 
         if error is None:
@@ -688,14 +925,30 @@ class AppController:
                 self._fallo_recarga(f"Trama sldo incompleta: {linea}")
                 return
 
-            tipo_fisico = saldo["tipo_fisico"]
+            pendiente = self._recarga_en_curso
+            if (pendiente and saldo['uid'] == pendiente['uid']
+                    and int(saldo['saldo_centavos']) == pendiente['objetivo']):
+                self._procesar_respuesta_recarga(
+                    f"ok,{pendiente['uid']},{pendiente['objetivo']},saldo_verificado"
+                )
+                return
+
+            tipo_fisico = str(
+                saldo["tipo_fisico"] or ""
+            ).strip().upper()
+
+            self.tipo_actual = tipo_fisico
             self.uid_actual = saldo["uid"]
             self.nombre_actual = saldo["nombre"]
             self.saldo_actual_centavos = int(saldo["saldo_centavos"])
 
             ui.texto4.setText(self.uid_actual or "-")
             ui.texto5.setText(self.nombre_actual or "-")
-            ui.texto1.setText(f"{self.saldo_actual_centavos / 100:.2f}")
+            ui.texto1.setText(f"${self.saldo_actual_centavos / 100:.2f}")
+            
+            if self.tipo_actual in ("KI", "DE"):
+                self._bloquear_recarga_operador()
+                return
 
             tipo_desde_tarjeta = ""
 
@@ -706,6 +959,24 @@ class AppController:
             
 
             tarjeta_db = self.recarga_model.obtener_tarjeta_por_uid(self.uid_actual)
+            
+            if tarjeta_db:
+                tipo_bd = str(
+                    tarjeta_db["tipo_tarjeta"] or ""
+                ).strip().lower()
+
+                if (
+                    tipo_bd in {"ki", "ope", "operador", "de", "despachador"}
+                    or "operador" in tipo_bd
+                    or "despachador" in tipo_bd
+                ):
+                    self.tipo_actual = (
+                        "DE"
+                        if tipo_bd == "de" or "despachador" in tipo_bd
+                        else "KI"
+                    )
+                    self._bloquear_recarga_operador()
+                    return
 
             if tarjeta_db:
                 ui.texto6.setText(tipo_desde_tarjeta or tarjeta_db["tipo_tarjeta"])
@@ -729,7 +1000,6 @@ class AppController:
         except Exception as e:
             self._fallo_recarga(f"No se pudo procesar la linea de saldo: {linea}", e)
 
-
     def _procesar_respuesta_recarga(self, linea: str) -> None:
         ui = self.current_ui
 
@@ -740,6 +1010,13 @@ class AppController:
                 return
 
             _, uid, nuevo_saldo_centavos, folio = partes[:4]
+            pendiente = self._recarga_en_curso
+            if (not pendiente or self._normalizar_uid(uid) != pendiente['uid']
+                    or int(nuevo_saldo_centavos) != pendiente['objetivo']):
+                return
+            self.monto_pendiente_centavos = pendiente['monto']
+            self.nombre_actual = pendiente['nombre']
+            self.oficina_recarga_actual = pendiente['oficina']
             nuevo_saldo = int(nuevo_saldo_centavos) / 100
             monto = self.monto_pendiente_centavos / 100
 
@@ -759,6 +1036,7 @@ class AppController:
                 raise
 
             print(f"[RECARGA] Guardada localmente: UID={uid}")
+            self._recarga_en_curso = None
             from core.database import DATABASE_PATH, get_connection
 
             print(f"[RECARGA] BASE REAL: {DATABASE_PATH.resolve()}")
@@ -784,8 +1062,8 @@ class AppController:
             QTimer.singleShot(0, self._sincronizar_pendientes)
 
             self.saldo_actual_centavos = int(nuevo_saldo_centavos)
-            ui.texto1.setText(f"{nuevo_saldo:.2f}")
-            ui.texto2.setText(f"{nuevo_saldo:.2f}")
+            ui.texto1.setText(f"${nuevo_saldo:.2f}")
+            ui.texto2.setText(f"${nuevo_saldo:.2f}")
             
             ui.texto7.clear()
             ui.texto7.setMaximumHeight(80)
@@ -801,13 +1079,7 @@ class AppController:
             else:
                                 ui.texto7.setText(mensaje)
                 
-            ui.texto7.setStyleSheet("""
-                color: #008000;
-                font-size: 28px;
-                font-weight: bold;
-                background: transparent;
-                border: none;
-                                    """)
+            ui.texto7.setProperty("estadoVisual", "success")
             
             ui.texto7.repaint()
             QTimer.singleShot(2500, self._limpiar_mensaje_recarga_exitosa)
@@ -820,6 +1092,21 @@ class AppController:
             self.monto_pendiente_centavos = 0
 
             tarjeta_db = self.recarga_model.obtener_tarjeta_por_uid(self.uid_actual)
+            if tarjeta_db:
+                tipo_bd = str(
+                    tarjeta_db["tipo_tarjeta"] or ""
+                ).strip().lower()
+
+                if (
+                    tipo_bd in {"ki", "ope", "operador", "de", "despachador"}
+                    or "operador" in tipo_bd
+                    or "despachador" in tipo_bd
+                ):
+                    self.tipo_actual = (
+                        "DE" if tipo_bd == "de" or "despachador" in tipo_bd else "KI"
+                    )
+                    self._bloquear_recarga_operador()
+                    return
             if tarjeta_db:
                 ui.texto6.setText(tarjeta_db["tipo_tarjeta"])
             self._actualizar_estado_vencimiento_tarjeta(tarjeta_db)
@@ -853,6 +1140,10 @@ class AppController:
         if not isinstance(ui, RecargaWindow):
             return
 
+        if self.tipo_actual in ("KI", "DE"):
+            self._bloquear_recarga_operador()
+            return
+
         ui.botonrecargar.setEnabled(False)
 
         if not self.uid_actual:
@@ -868,11 +1159,11 @@ class AppController:
             ("No se puede exceder", "No puedes descontar")
         ):
             ui.texto7.clear()
-            ui.texto7.setStyleSheet("")
+            ui.texto7.setProperty("estadoVisual", "")
 
         if not texto:
             ui.texto2.setText(
-                f"{self.saldo_actual_centavos / 100:.2f}"
+                f"${self.saldo_actual_centavos / 100:.2f}"
             )
             return
 
@@ -888,7 +1179,7 @@ class AppController:
             return
 
         nuevo = self.saldo_actual_centavos + centavos
-        ui.texto2.setText(f"{nuevo / 100:.2f}")
+        ui.texto2.setText(f"${nuevo / 100:.2f}")
 
         mensaje = ""
 
@@ -909,140 +1200,221 @@ class AppController:
             ui.texto7.setText(mensaje)
             ui.texto7.setWordWrap(True)
             ui.texto7.setMaximumHeight(80)
-            ui.texto7.setStyleSheet(
-                "color: red; font-weight: bold;"
-            )
+            ui.texto7.setProperty("estadoVisual", "error")
             return
 
         ui.botonrecargar.setEnabled(centavos != 0)
     
     def _ejecutar_recarga(self) -> None:
-        ui = self.current_ui
+        from core.carga import cargando
+        with cargando(self.current_window, "Guardando recarga y esperando al lector…",
+                      pendiente=lambda: self._recarga_en_curso is not None and self.current_ui.texto7.property("estadoVisual") != "error"):
+            if self._recarga_en_curso:
+                QMessageBox.warning(
+                    self.current_window, 'Recarga pendiente',
+                    'La recarga anterior aún no está comprobada y guardada. '
+                    'Retira y acerca esa tarjeta para consultar su saldo antes de continuar. '
+                    'No repitas la recarga ni cierres la aplicación.'
+                )
+                return
+            ui = self.current_ui
 
-        if not self.uid_actual:
-            QMessageBox.warning(self.current_window, "Error", "Primero acerca una tarjeta.")
-            return
-
-        tarjeta_db = self.recarga_model.obtener_tarjeta_por_uid(self.uid_actual)
-
-        if tarjeta_db and int(tarjeta_db["en_lista_negra"]) == 1:
-            self._aplicar_bloqueo_lista_negra_recarga(True)
-            QMessageBox.warning(
-                self.current_window,
-                "Tarjeta en lista negra",
-                "La tarjeta está en lista negra y no se puede recargar."
-            )
-            return
-        else:
-            self._aplicar_bloqueo_lista_negra_recarga(False)
-
-    
-        self._actualizar_estado_vencimiento_tarjeta(tarjeta_db)
-        if self.tarjeta_vencida:
-            QMessageBox.warning(
-                self.current_window,
-                "Tarjeta vencida",
-                "La tarjeta está vencida y no se puede recargar."
-            )
-            return
-        
-        oficina = self._oficina_seleccionada_recarga()
-        
-        if not oficina:
-            QMessageBox.warning(
-                self.current_window,
-                "Oficina requerida",
-                "Selecciona una oficina."
-            )
-            return
-        self.oficina_recarga_actual = oficina
-
-        texto_monto = self._texto_monto_recarga()
-        if not texto_monto:
-            QMessageBox.warning(self.current_window, "Error", "Captura el monto.")
-            return
-
-        try:
-            monto = float(texto_monto)
-        except ValueError:
-            QMessageBox.warning(self.current_window, "Error", "Monto invalido.")
-            return
-
-                # También rechaza valores no válidos como infinito o NaN.
-        if not (-42949672.95 <= monto <= 400.00):
-            QMessageBox.warning(
-                self.current_window,
-                "Monto inválido",
-                "Para recargar, captura hasta $400.\n"
-                "Para descontar, escribe una cantidad negativa."
-            )
-            return
-
-        centavos = round(monto * 100)
-
-        if centavos == 0:
-            QMessageBox.warning(
-                self.current_window, "Error",
-                "El monto debe ser diferente de cero."
-            )
-            return
-
-        nuevo_saldo = self.saldo_actual_centavos + centavos
-
-        if nuevo_saldo < 0:
-            QMessageBox.warning(
-                self.current_window,
-                "Saldo insuficiente",
-                "No puedes descontar más del saldo disponible."
-            )
-            return
-
-        # El máximo de $400 aplica solamente al agregar saldo.
-        if centavos > 0 and nuevo_saldo > 40000:
-            disponible = max(0, 40000 - self.saldo_actual_centavos)
-
-            QMessageBox.warning(
-                self.current_window,
-                "Saldo máximo permitido",
-                "No se puede exceder el saldo máximo de $400.00.\n\n"
-                f"Saldo actual: ${self.saldo_actual_centavos / 100:.2f}\n"
-                f"Intentas recargar: ${centavos / 100:.2f}\n"
-                f"Puedes recargar hasta: ${disponible / 100:.2f}"
-            )
-            return
-
-        if centavos < 0:
-            respuesta = QMessageBox.question(
-                self.current_window,
-                "Confirmar descuento",
-                f"¿Descontar ${abs(centavos) / 100:,.2f}?\n"
-                f"Tarjeta: {self.uid_actual}\n"
-                f"Saldo resultante: ${nuevo_saldo / 100:,.2f}",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
-            )
-            if respuesta != QMessageBox.Yes:
+            if not self.uid_actual:
+                QMessageBox.warning(self.current_window, "Error", "Primero acerca una tarjeta.")
                 return
 
-        self.monto_pendiente_centavos = centavos
+            tarjeta_db = self.recarga_model.obtener_tarjeta_por_uid(
+                self.uid_actual
+            )
+            es_operador = self.tipo_actual in ("KI", "DE")
 
-        try:
-            accion = "di" if centavos < 0 else "rc"
-            comando = f"{accion},{self.uid_actual},{abs(centavos)}"
-            self.arduino.enviar_linea(comando)
-            ui.texto7.setText("Enviando recarga...")
-            ui.texto7.setMaximumHeight(40)
-            ui.texto7.setStyleSheet("""
-                color: #1f5fa8;
-                font-size: 18px;
-                font-weight: bold;
-            """)
+            if tarjeta_db:
+                tipo_bd = str(
+                    tarjeta_db["tipo_tarjeta"] or ""
+                ).strip().lower()
+
+                es_operador = (
+                    es_operador
+                    or tipo_bd in {
+                        "ki", "ope", "operador",
+                        "de", "despachador"
+                    }
+                    or "operador" in tipo_bd
+                    or "despachador" in tipo_bd
+                )
+
+                if tipo_bd == "de" or "despachador" in tipo_bd:
+                    self.tipo_actual = "DE"
+
+            if es_operador:
+                if self.tipo_actual != "DE":
+                    self.tipo_actual = "KI"
+
+                self._bloquear_recarga_operador()
+
+                QMessageBox.warning(
+                    self.current_window,
+                    "Tarjeta de personal",
+                    "La tarjeta de Despachador no admite recargas."
+                    if self.tipo_actual == "DE"
+                    else "La tarjeta de operador no admite recargas.",
+                )
+                return
+
+            if tarjeta_db and int(tarjeta_db["en_lista_negra"]) == 1:
+                self._aplicar_bloqueo_lista_negra_recarga(True)
+                QMessageBox.warning(
+                    self.current_window,
+                    "Tarjeta en lista negra",
+                    "La tarjeta está en lista negra y no se puede recargar."
+                )
+                return
+            else:
+                self._aplicar_bloqueo_lista_negra_recarga(False)
+
+    
+            self._actualizar_estado_vencimiento_tarjeta(tarjeta_db)
+            if self.tarjeta_vencida:
+                QMessageBox.warning(
+                    self.current_window,
+                    "Tarjeta vencida",
+                    "La tarjeta está vencida y no se puede recargar."
+                )
+                return
+        
+            oficina = self._oficina_seleccionada_recarga()
+        
+            if not oficina:
+                QMessageBox.warning(
+                    self.current_window,
+                    "Oficina requerida",
+                    "Selecciona una oficina."
+                )
+                return
+            self.oficina_recarga_actual = oficina
+
+            texto_monto = self._texto_monto_recarga()
+            if not texto_monto:
+                QMessageBox.warning(self.current_window, "Error", "Captura el monto.")
+                return
+
+            try:
+                monto = float(texto_monto)
+            except ValueError:
+                QMessageBox.warning(self.current_window, "Error", "Monto invalido.")
+                return
+
+                    # También rechaza valores no válidos como infinito o NaN.
+            if not (-42949672.95 <= monto <= 400.00):
+                QMessageBox.warning(
+                    self.current_window,
+                    "Monto inválido",
+                    "Para recargar, captura hasta $400.\n"
+                    "Para descontar, escribe una cantidad negativa."
+                )
+                return
+
+            centavos = round(monto * 100)
+
+            if centavos == 0:
+                QMessageBox.warning(
+                    self.current_window, "Error",
+                    "El monto debe ser diferente de cero."
+                )
+                return
+
+            nuevo_saldo = self.saldo_actual_centavos + centavos
+
+            if nuevo_saldo < 0:
+                QMessageBox.warning(
+                    self.current_window,
+                    "Saldo insuficiente",
+                    "No puedes descontar más del saldo disponible."
+                )
+                return
+
+            # El máximo de $400 aplica solamente al agregar saldo.
+            if centavos > 0 and nuevo_saldo > 40000:
+                disponible = max(0, 40000 - self.saldo_actual_centavos)
+
+                QMessageBox.warning(
+                    self.current_window,
+                    "Saldo máximo permitido",
+                    "No se puede exceder el saldo máximo de $400.00.\n\n"
+                    f"Saldo actual: ${self.saldo_actual_centavos / 100:.2f}\n"
+                    f"Intentas recargar: ${centavos / 100:.2f}\n"
+                    f"Puedes recargar hasta: ${disponible / 100:.2f}"
+                )
+                return
+
+            if centavos < 0:
+                respuesta = QMessageBox.question(
+                    self.current_window,
+                    "Confirmar descuento",
+                    f"¿Descontar ${abs(centavos) / 100:,.2f}?\n"
+                    f"Tarjeta: {self.uid_actual}\n"
+                    f"Saldo resultante: ${nuevo_saldo / 100:,.2f}",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                if respuesta != QMessageBox.Yes:
+                    return
+
+            self.monto_pendiente_centavos = centavos
+
+            try:
+                accion = "di" if centavos < 0 else "rc"
+                comando = f"{accion},{self.uid_actual},{abs(centavos)}"
+                self._recarga_en_curso = {
+                    'uid': self.uid_actual, 'objetivo': nuevo_saldo,
+                    'monto': centavos, 'nombre': self.nombre_actual,
+                    'oficina': self.oficina_recarga_actual,
+                }
+                self.arduino.enviar_linea(comando)
+                ui.texto7.setText("Enviando recarga...")
+                ui.texto7.setMaximumHeight(40)
+                ui.texto7.setProperty("estadoVisual", "info")
             
             
-        except Exception as e:
-            self._fallo_recarga("No se pudo enviar la recarga al Arduino", e)
-            QMessageBox.critical(self.current_window, "Error", f"No se pudo enviar la recarga: {e}")
+            except Exception as e:
+                self._fallo_recarga("No se pudo enviar la recarga al Arduino", e)
+                QMessageBox.critical(self.current_window, "Error", f"No se pudo enviar la recarga: {e}")
             
+    # =========================
+    #         BLOQUEO DE RECARGA OPERADOR
+    # =========================
+    def _bloquear_recarga_operador(self) -> None:
+        if not isinstance(self.current_ui, RecargaWindow):
+            return
+
+        ui = self.current_ui
+
+        monto = self._campo_monto_recarga()
+
+        if monto is not None:
+            estado_anterior = monto.blockSignals(True)
+            monto.clear()
+            monto.blockSignals(estado_anterior)
+            monto.setEnabled(False)
+
+        self.monto_pendiente_centavos = 0
+
+        ui.texto6.setText("Despachador" if self.tipo_actual == "DE" else "Operador")
+        ui.texto2.setText(
+            f"${self.saldo_actual_centavos / 100:.2f}"
+        )
+
+        ui.botonrecargar.setEnabled(False)
+
+        ui.texto7.setText(
+            "La tarjeta de Despachador no admite recargas."
+            if self.tipo_actual == "DE"
+            else "La tarjeta de operador no admite recargas."
+        )
+
+        ui.texto7.setProperty("estadoVisual", "warning")
+    
+    
     # =========================
     #           ALTA
     # =========================
@@ -1055,7 +1427,7 @@ class AppController:
 
     def _mostrar_error_alta_sin_internet(self) -> None:
         ui = self.current_ui
-        ui.labelEstadoConexion.setStyleSheet("color: red; font-weight: bold;")
+        ui.labelEstadoConexion.setProperty("estadoVisual", "error")
         ui.labelEstadoConexion.setText(
             "Sin conexion"
         )
@@ -1066,7 +1438,7 @@ class AppController:
 
 
     def _ocultar_error_alta_sin_internet(self) -> None:
-        if not isinstance(self.current_ui, AltaWindow):
+        if not isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             return
 
         if hasattr(self.current_ui, "mensajeInternet"):
@@ -1075,7 +1447,7 @@ class AppController:
 
 
     def _set_alta_inputs_enabled(self, enabled: bool) -> None:
-        if not isinstance(self.current_ui, AltaWindow):
+        if not isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             return
 
         ui = self.current_ui
@@ -1097,7 +1469,7 @@ class AppController:
                 
     
     def _limpiar_forulario_alta(self) -> None:
-        if not isinstance(self.current_ui, AltaWindow):
+        if not isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             return
         
         ui = self.current_ui
@@ -1106,15 +1478,10 @@ class AppController:
         self.alta_pendiente = None
         self.foto_alta_path = ""
         
-        widgets_con_senales = [
-            ui.textonombre,
-            ui.textocurp,
-            ui.textofechanacimiento,
-            ui.textovigencia,
-            ui.calendario,
-            ui.normal,
-            ui.preferencial
-        ]
+        widgets_con_senales = [getattr(ui, nombre) for nombre in (
+            "textonombre", "textocurp", "textofechanacimiento", "textovigencia",
+            "calendario", "normal", "preferencial"
+        ) if hasattr(ui, nombre)]
         
         for widget in widgets_con_senales:
             widget.blockSignals(True)
@@ -1128,7 +1495,8 @@ class AppController:
                 ui.curpstatus.clear()
                 
             ui.normal.setChecked(True)
-            ui.preferencial.setChecked(False)
+            if hasattr(ui, "preferencial"):
+                ui.preferencial.setChecked(False)
             
             ui.calendario.setSelectedDate(QDate.currentDate())
             ui.textovigencia.setPlainText(
@@ -1137,17 +1505,30 @@ class AppController:
             
             ui.fotoimagen.clear()
             ui.fotoimagen.setText("Sin foto")
+            if isinstance(ui, AltaWindow) and hasattr(ui, "label_33"):
+                ui.label_33.setText("Sin archivo seleccionado")
+            if isinstance(ui, Ui_AltaOWindow):
+                ui.label_5.setText("Sin archivo seleccionado")
             
             ui.textonombre.setFocus()
             
         finally:
             for widget in widgets_con_senales:
                 widget.blockSignals(False)
+
+    def _cancelar_formulario_alta(self) -> None:
+        if self.alta_pendiente:
+            QMessageBox.warning(
+                self.current_window, "Alta en proceso",
+                "Espera la confirmación de la tarjeta antes de cancelar."
+            )
+            return
+        self._regresar_pantalla_anterior()
     
      
 
     def _seleccionar_foto_alta(self) -> None:
-        if not isinstance(self.current_ui, AltaWindow):
+        if not isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             return
 
         ui = self.current_ui
@@ -1162,38 +1543,50 @@ class AppController:
         if not archivo:
             return
 
-        carpeta_fotos = Path(__file__).resolve().parent.parent / "data" / "fotos"
-        carpeta_fotos.mkdir(exist_ok=True)
-
         origen = Path(archivo)
-        destino = carpeta_fotos / origen.name
-        shutil.copy2(origen, destino)
+        if not origen.is_file():
+            QMessageBox.warning(
+                self.current_window,
+                "Foto",
+                "El archivo seleccionado no está disponible.",
+            )
+            return
 
-        self.foto_alta_path = str(destino)
+        self.foto_alta_path = str(origen)
 
-        pixmap = QPixmap(str(destino))
+        pixmap = QPixmap(str(origen))
         ui.fotoimagen.setPixmap(
             pixmap.scaled(200, 200)
         )
+        if isinstance(ui, Ui_AltaOWindow):
+            ui.label_5.setText(origen.name)
+        elif hasattr(ui, "label_33"):
+            ui.label_33.setText(origen.name)
 
 
     def _limpiar_foto_alta(self) -> None:
-        if not isinstance(self.current_ui, AltaWindow):
+        if not isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             return
 
         self.foto_alta_path = ""
         self.current_ui.fotoimagen.clear()
         self.current_ui.fotoimagen.setText("Sin foto")
+        if isinstance(self.current_ui, Ui_AltaOWindow):
+            self.current_ui.label_5.setText("Sin archivo seleccionado")
+        elif hasattr(self.current_ui, "label_33"):
+            self.current_ui.label_33.setText("Sin archivo seleccionado")
 
 
     def _mostrar_calendario_nacimiento(self) -> None:
-        if not isinstance(self.current_ui, AltaWindow):
+        if not isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             return
 
         dialog = QDialog(self.current_window)
         dialog.setWindowTitle("Seleccionar fecha")
 
         layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
         calendario = QCalendarWidget(dialog)
         layout.addWidget(calendario)
 
@@ -1224,7 +1617,7 @@ class AppController:
         ui.textofechanacimiento.textChanged.connect(self._formatear_fecha_nacimiento_alta)
         
         if hasattr(ui, "curpstatus"):
-            ui.curpstatus.setStyleSheet("color: red; font-weight: bold;")
+            ui.curpstatus.setProperty("estadoVisual", "error")
             if hasattr(ui.curpstatus, "setPlainText"):
                 ui.curpstatus.setPlainText("")
             else:
@@ -1242,21 +1635,23 @@ class AppController:
         ui.fotoimagen.setScaledContents(True)
   
         ui.botonsubir.clicked.connect(self._seleccionar_foto_alta)
-        ui.botontomar.clicked.connect(self._limpiar_foto_alta)
+        if hasattr(ui, "botontomar"):
+            ui.botontomar.clicked.connect(self._limpiar_foto_alta)
 
         # ESTE ES EL QUE TE FALTA
-        ui.pushButton.clicked.connect(self._mostrar_calendario_nacimiento)
+        if hasattr(ui, "pushButton"):
+            ui.pushButton.clicked.connect(self._mostrar_calendario_nacimiento)
 
         icono_calendario = Path(__file__).resolve().parent.parent / "assets" / "calendario.png"
 
-        if icono_calendario.exists():
+        if hasattr(ui, "pushButton") and icono_calendario.exists():
             ui.pushButton.setIcon(QIcon(str(icono_calendario)))
             ui.pushButton.setIconSize(QSize(24, 24))
             ui.pushButton.setText("")
-        else:
+        elif hasattr(ui, "pushButton"):
             print(f"No se encontró el icono: {icono_calendario}")
 
-        ui.labelEstadoConexion.setStyleSheet("color: #245E91; font-weight: bold;")
+        ui.labelEstadoConexion.setProperty("estadoVisual", "info")
         ui.labelEstadoConexion.setText("● Listo")
         
 
@@ -1278,7 +1673,7 @@ class AppController:
         
 
     def _actualizar_vigencia_desde_calendario(self) -> None:
-        if not isinstance(self.current_ui, AltaWindow):
+        if not isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             return
 
         ui = self.current_ui
@@ -1304,7 +1699,7 @@ class AppController:
             )
 
     def _leer_serial_alta(self, mostrar_errores: bool = True) -> None:
-        if not isinstance(self.current_ui, AltaWindow):
+        if not isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             return
 
         ui = self.current_ui
@@ -1576,175 +1971,204 @@ class AppController:
         )
 
     def _set_curp_status_alta(self, mensaje: str, *, error: bool = False) -> None:
-        if not isinstance(self.current_ui, AltaWindow):
+        if not isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             return
 
         if not hasattr(self.current_ui, "curpstatus"):
             return
 
-        color = "#B42318" if error else "#137333"
-        self.current_ui.curpstatus.setStyleSheet(
-            f"color: {color}; font-weight: bold;"
-        )
+        color = "error" if error else "success"
+        self.current_ui.curpstatus.setProperty("estadoVisual", color)
         self.current_ui.curpstatus.setText(mensaje)
 
     def _ejecutar_alta(self) -> None:
-        if not isinstance(self.current_ui, AltaWindow):
+        if not isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             return
 
-        ui = self.current_ui
+        from core.carga import cargando
+        with cargando(self.current_window, "Guardando alta de tarjeta…",
+                      pendiente=lambda: self.alta_pendiente is not None):
+            ui = self.current_ui
 
-        self.alta_pendiente = None
+            self.alta_pendiente = None
 
-        if not self._hay_internet_para_alta():
-            self._mostrar_error_alta_sin_internet()
-            return
+            self._leer_serial_alta(False)
 
-        self._leer_serial_alta(False)
+            if not self.uid_alta_actual and not self._esperar_uid_alta_disponible():
+                self._mostrar_error_uid_alta_no_disponible()
+                return
 
-        if not self.uid_alta_actual and not self._esperar_uid_alta_disponible():
-            self._mostrar_error_uid_alta_no_disponible()
-            return
-
-        nombre_pasajero_completo = re.sub(
-            r"\s+",
-            " ",
-            ui.textonombre.toPlainText().strip(),
-        )
-        alias_tarjeta = self._limpiar_alias_para_arduino(nombre_pasajero_completo)
-
-        if not nombre_pasajero_completo or not alias_tarjeta:
-            QMessageBox.warning(
-                self.current_window,
-                "Error",
-                "Captura el nombre."
+            nombre_pasajero_completo = re.sub(
+                r"\s+",
+                " ",
+                ui.textonombre.toPlainText().strip(),
             )
-            return
+            alias_tarjeta = self._limpiar_alias_para_arduino(nombre_pasajero_completo)
 
-        curp_alta = ui.textocurp.toPlainText().strip().upper()
+            if not nombre_pasajero_completo or not alias_tarjeta:
+                QMessageBox.warning(
+                    self.current_window,
+                    "Error",
+                    "Captura el nombre."
+                )
+                return
 
-        if not curp_alta or curp_alta == "-":
-            QMessageBox.warning(
-                self.current_window,
-                "CURP requerida",
-                "Captura la CURP."
-            )
-            return
+            curp_alta = ui.textocurp.toPlainText().strip().upper()
 
-        # 1. Validar primero en la base local
-        try:
-            curp_local = self.alta_model.buscar_curp_local(curp_alta)
-        except Exception as e:
-            QMessageBox.critical(
-                self.current_window,
-                "Error",
-                f"No se pudo validar la CURP en la base local:\n\n{e}"
-            )
-            return
+            if not curp_alta or curp_alta == "-":
+                QMessageBox.warning(
+                    self.current_window,
+                    "CURP requerida",
+                    "Captura la CURP."
+                )
+                return
 
-        if curp_local:
+            # 1. Validar primero en la base local
+            try:
+                curp_local = self.alta_model.buscar_curp_local(curp_alta)
+            except Exception as e:
+                QMessageBox.critical(
+                    self.current_window,
+                    "Error",
+                    f"No se pudo validar la CURP en la base local:\n\n{e}"
+                )
+                return
+
+            if curp_local:
+                self._set_curp_status_alta(
+                    f"La CURP {curp_alta} ya esta registrado.",
+                    error=True
+                )
+                return
+
+            # 2. Validar también en el servidor
+                    # Si no responde el servidor, se permite guardar localmente.
+            try:
+                curp_servidor = (
+                    self.alta_model.buscar_curp_servidor(curp_alta)
+                )
+            except Exception:
+                curp_servidor = None
+
+            uid_alta = self._normalizar_uid(self.uid_alta_actual)
+
+            if not uid_alta:
+                self._mostrar_error_uid_alta_no_disponible()
+                return
+        
+            from core.database import get_connection
+            from core.lista_negra_local import bloqueo_local
+
+            with get_connection() as connection:
+                existe_uid = connection.execute(
+                    "SELECT 1 FROM tarjetas WHERE uid = ?",
+                    (uid_alta,),
+                ).fetchone()
+
+            if existe_uid or bloqueo_local(uid_alta):
+                QMessageBox.warning(
+                    self.current_window,
+                    "Tarjeta registrada",
+                    "La tarjeta ya existe o está bloqueada. "
+                    "Usa la operación correspondiente.",
+                )
+                return
+        
+            if isinstance(ui, Ui_AltaOWindow):
+                no_tarjeta = "KI"
+
+            if curp_servidor:
+                self._set_curp_status_alta(
+                    f"La CURP {curp_alta} ya esta registrado.",
+                    error=True
+                )
+                return
+
+
+            fecha = ui.calendario.selectedDate()
             self._set_curp_status_alta(
-                f"La CURP {curp_alta} ya esta registrado.",
-                error=True
+                f"CURP {curp_alta} disponible.",
+                error=False
             )
-            return
+            vigtarifa = fecha.toString("ddMMyy")
+            hora_actual = QDateTime.currentDateTime().toString("HHmmss")
+            vigencia12 = vigtarifa + hora_actual
 
-        # 2. Validar también en el servidor
-        try:
-            curp_servidor = self.alta_model.buscar_curp_servidor(curp_alta)
-        except Exception:
-            self._mostrar_error_alta_sin_internet()
-            return
+            if len(vigtarifa) != 6 or not vigtarifa.isdigit():
+                QMessageBox.warning(
+                    self.current_window,
+                    "Error",
+                    "VIGTARIFA invalida."
+                )
+                return
 
-        if curp_servidor:
-            self._set_curp_status_alta(
-                f"La CURP {curp_alta} ya esta registrado.",
-                error=True
+            if len(vigencia12) != 12 or not vigencia12.isdigit():
+                QMessageBox.warning(
+                    self.current_window,
+                    "Error",
+                    "VIGENCIA12 invalida."
+                )
+                return
+
+            uid_alta = self._normalizar_uid(self.uid_alta_actual)
+
+            if not uid_alta:
+                self._mostrar_error_uid_alta_no_disponible()
+                return
+
+            if isinstance(ui, Ui_AltaOWindow):
+                tipo_local = "DE" if ui.normal.isChecked() else "KI"
+                no_tarjeta = tipo_local
+            elif hasattr(ui, "preferencial") and ui.preferencial.isChecked():
+                no_tarjeta = "EU"
+                tipo_local = "EU"
+            else:
+                no_tarjeta = "NO"
+                tipo_local = "NO"
+
+            id_tipo_tarjeta = "02"
+            id_tarifa = "01"
+            alias_tarjeta = self._ajustar_alias_para_comando_alta(
+                uid_alta,
+                alias_tarjeta,
+                no_tarjeta,
+                id_tipo_tarjeta,
+                id_tarifa,
+                vigtarifa,
+                vigencia12,
             )
-            return
 
+            if not alias_tarjeta:
+                QMessageBox.warning(
+                    self.current_window,
+                    "Error",
+                    "El nombre queda vacio al preparar el comando para Arduino."
+                )
+                return
 
-        fecha = ui.calendario.selectedDate()
-        self._set_curp_status_alta(
-            f"CURP {curp_alta} disponible.",
-            error=False
-        )
-        vigtarifa = fecha.toString("ddMMyy")
-        hora_actual = QDateTime.currentDateTime().toString("HHmmss")
-        vigencia12 = vigtarifa + hora_actual
-
-        if len(vigtarifa) != 6 or not vigtarifa.isdigit():
-            QMessageBox.warning(
-                self.current_window,
-                "Error",
-                "VIGTARIFA invalida."
+            comando = (
+                f"al,{uid_alta},{alias_tarjeta},{no_tarjeta},"
+                f"{id_tipo_tarjeta},{id_tarifa},{vigtarifa},{vigencia12}"
             )
-            return
 
-        if len(vigencia12) != 12 or not vigencia12.isdigit():
-            QMessageBox.warning(
-                self.current_window,
-                "Error",
-                "VIGENCIA12 invalida."
-            )
-            return
-
-        uid_alta = self._normalizar_uid(self.uid_alta_actual)
-
-        if not uid_alta:
-            self._mostrar_error_uid_alta_no_disponible()
-            return
-
-        if ui.preferencial.isChecked():
-            no_tarjeta = "EU"
-            tipo_local = "EU"
-        else:
-            no_tarjeta = "NO"
-            tipo_local = "NO"
-
-        id_tipo_tarjeta = "02"
-        id_tarifa = "01"
-        alias_tarjeta = self._ajustar_alias_para_comando_alta(
-            uid_alta,
-            alias_tarjeta,
-            no_tarjeta,
-            id_tipo_tarjeta,
-            id_tarifa,
-            vigtarifa,
-            vigencia12,
-        )
-
-        if not alias_tarjeta:
-            QMessageBox.warning(
-                self.current_window,
-                "Error",
-                "El nombre queda vacio al preparar el comando para Arduino."
-            )
-            return
-
-        comando = (
-            f"al,{uid_alta},{alias_tarjeta},{no_tarjeta},"
-            f"{id_tipo_tarjeta},{id_tarifa},{vigtarifa},{vigencia12}"
-        )
-
-        self.alta_pendiente = {
-            "uid": uid_alta,
-            "nombre_pasajero": nombre_pasajero_completo,
-            "alias_tarjeta": alias_tarjeta,
-            "tipo": tipo_local,
-            "vigencia": vigencia12,
-            "curp": curp_alta,
-            "fecha_nacimiento": ui.textofechanacimiento.toPlainText().strip(),
-            "foto": self.foto_alta_path,
-            "fase": "esperando_alta",
-            "comando_alta": comando,
-            "reintentos_alta": 0,
-        }
+            self.alta_pendiente = {
+                "uid": uid_alta,
+                "nombre_pasajero": nombre_pasajero_completo,
+                "alias_tarjeta": alias_tarjeta,
+                "tipo": tipo_local,
+                "vigencia": vigencia12,
+                "curp": curp_alta,
+                "fecha_nacimiento": ui.textofechanacimiento.toPlainText().strip(),
+                "foto": self.foto_alta_path,
+                "fase": "esperando_alta",
+                "comando_alta": comando,
+                "reintentos_alta": 0,
+            }
 
         
 
-        print("[ALTA] Enviando alta:", comando)
-        self.arduino.enviar_linea(comando)
+            print("[ALTA] Enviando alta:", comando)
+            self.arduino.enviar_linea(comando)
         
         
     # =========================
@@ -1758,6 +2182,8 @@ class AppController:
         ui = self.current_ui
 
         self.uid_cancelar_actual = ""
+        self.tipo_cancelar_actual = ""
+        self.saldo_cancelar_actual = 0.0
         self.nombre_cancelar_actual = ""
 
         ui.textonombre.setPlainText("")
@@ -1810,11 +2236,25 @@ class AppController:
 
             if linea_minusculas.startswith("sldo,"):
                 try:
-                    _, uid, saldo, nombre = linea.split(",", 3)
-                    uid = self._normalizar_uid(uid)
-                    if not uid:
+                    lectura = self._parsear_trama_saldo(linea)
+
+                    if not lectura:
                         continue
 
+                    uid = self._normalizar_uid(
+                        lectura["uid"]
+                    )
+                    saldo = lectura["saldo_centavos"]
+                    nombre = lectura["nombre"]
+
+                    self.tipo_cancelar_actual = (
+                        lectura["tipo_fisico"]
+                    )
+                    self.saldo_cancelar_actual = (
+                        int(saldo) / 100
+                    )
+                    if not uid:
+                        continue
                     self.uid_cancelar_actual = uid
                     self.nombre_cancelar_actual = nombre.strip()
 
@@ -1884,6 +2324,15 @@ class AppController:
         ui = self.current_ui
         nombre_db = (tarjeta["nombre_pasajero"] or "").strip()
         motivo_db = (tarjeta["motivo_baja"] or "").strip()
+        tipo_db = str(dict(tarjeta).get("tipo_tarjeta") or "").strip().lower()
+        if tipo_db == "de" or "despachador" in tipo_db:
+            self.tipo_cancelar_actual = "DE"
+        elif tipo_db in ("ki", "ope") or "operador" in tipo_db:
+            self.tipo_cancelar_actual = "KI"
+        elif tipo_db == "eu" or "prefer" in tipo_db:
+            self.tipo_cancelar_actual = "EU"
+        elif tipo_db in ("no", "normal"):
+            self.tipo_cancelar_actual = "NO"
 
         self.nombre_cancelar_actual = nombre_db or nombre_fallback.strip()
         ui.textonombre.setPlainText(self.nombre_cancelar_actual)
@@ -1894,42 +2343,45 @@ class AppController:
         if not isinstance(self.current_ui, CancelarWindow):
             return
 
-        ui = self.current_ui
+        from core.carga import cargando
+        with cargando(self.current_window, "Guardando cancelación…"):
+            ui = self.current_ui
 
-        if not self.uid_cancelar_actual:
-            QMessageBox.warning(self.current_window, "Error", "Primero acerca una tarjeta.")
-            return
+            if not self.uid_cancelar_actual:
+                QMessageBox.warning(self.current_window, "Error", "Primero acerca una tarjeta.")
+                return
 
-        motivo = ui.textomotivo.toPlainText().strip()
-        nombre_capturado = ui.textonombre.toPlainText().strip()
+            motivo = ui.textomotivo.toPlainText().strip()
+            nombre_capturado = ui.textonombre.toPlainText().strip()
 
-        if not motivo:
-            QMessageBox.warning(self.current_window, "Error", "Captura el motivo de la baja.")
-            return
+            if not motivo:
+                QMessageBox.warning(self.current_window, "Error", "Captura el motivo de la baja.")
+                return
 
-        try:
-            tarjeta_id = self.cancelar_model.cancelar_tarjeta_flexible(
-                uid=self.uid_cancelar_actual,
-                nombre_pasajero=nombre_capturado,
-                saldo_actual=0.0,
-                en_lista_negra=True,
-                motivo_baja=motivo
-            )
+            try:
+                tarjeta_id = self.cancelar_model.cancelar_tarjeta_flexible(
+                    uid=self.uid_cancelar_actual,
+                    nombre_pasajero=nombre_capturado,
+                    saldo_actual=0.0,
+                    en_lista_negra=True,
+                    motivo_baja=motivo,
+                    tipo_codigo_local=self.tipo_cancelar_actual,
+                )
 
-            ui.listanegra.setChecked(True)
+                ui.listanegra.setChecked(True)
 
-            QMessageBox.information(
-                self.current_window,
-                "Cancelar",
-                f"Tarjeta Cancelada correctamente."
-            )
+                QMessageBox.information(
+                    self.current_window,
+                    "Cancelar",
+                    f"Tarjeta Cancelada correctamente."
+                )
 
-        except Exception as e:
-            QMessageBox.critical(
-                self.current_window,
-                "Error",
-                f"No se pudo cancelar la tarjeta: {e}"
-            )
+            except Exception as e:
+                QMessageBox.critical(
+                    self.current_window,
+                    "Error",
+                    f"No se pudo cancelar la tarjeta: {e}"
+                )
             
     # =========================
     # REACTIVAR TARJETA (LISTA NEGRA)
@@ -1953,7 +2405,8 @@ class AppController:
                 nombre_pasajero = nombre_capturado,
                 saldo_actual = 0.0,
                 en_lista_negra=False,
-                motivo_baja = ""
+                motivo_baja = "",
+                tipo_codigo_local=self.tipo_cancelar_actual,
             )
             
             ui.listanegra.setChecked(False)
@@ -1974,8 +2427,15 @@ class AppController:
 
 
           
-    def _aplicar_bloqueo_lista_negra_recarga(self, bloqueada: bool) -> None:
+    def _aplicar_bloqueo_lista_negra_recarga(
+        self,
+        bloqueada: bool,
+    ) -> None:
         if not isinstance(self.current_ui, RecargaWindow):
+            return
+
+        if self.tipo_actual in ("KI", "DE"):
+            self._bloquear_recarga_operador()
             return
 
         ui = self.current_ui
@@ -1988,16 +2448,16 @@ class AppController:
                 monto.clear()
                 monto.setEnabled(False)
                 
-            ui.texto2.setText(f"{self.saldo_actual_centavos / 100:.2f}")
+            ui.texto2.setText(f"${self.saldo_actual_centavos / 100:.2f}")
             ui.botonrecargar.setEnabled(False)
             ui.texto7.setText("Tarjeta en lista negra.")
-            ui.texto7.setStyleSheet("color: red; font-weight: bold;")
+            ui.texto7.setProperty("estadoVisual", "error")
             return
         
         if monto is not None:
             monto.setEnabled(not self.tarjeta_vencida)
         
-        ui.texto2.setText(f"{self.saldo_actual_centavos / 100:.2f}")
+        ui.texto2.setText(f"${self.saldo_actual_centavos / 100:.2f}")
         ui.botonrecargar.setEnabled(not self.tarjeta_vencida)
         
         texto_actual = ""
@@ -2009,7 +2469,7 @@ class AppController:
         if texto_actual == "Tarjeta en lista negra.":
             ui.texto7.clear()
             
-        ui.texto7.setStyleSheet("")
+        ui.texto7.setProperty("estadoVisual", "")
         
         
     def _limpiar_interfaz_por_retiro_tarjeta(self) -> None:
@@ -2017,7 +2477,7 @@ class AppController:
             self._limpiar_recarga_por_retiro()
             return
 
-        if isinstance(self.current_ui, AltaWindow):
+        if isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             self._limpiar_alta_por_retiro()
             return
 
@@ -2047,10 +2507,10 @@ class AppController:
         ui.texto4.setText("-")
         ui.texto5.setText("-")
         ui.texto6.setText("-")
-        ui.texto1.setText("0.00")
-        ui.texto2.setText("0.00")
+        ui.texto1.setText("$0.00")
+        ui.texto2.setText("$0.00")
         ui.texto7.clear()
-        ui.texto7.setStyleSheet("")
+        ui.texto7.setProperty("estadoVisual", "")
         ui.botonrecargar.setEnabled(True)
 
         monto = self._campo_monto_recarga()
@@ -2060,7 +2520,7 @@ class AppController:
 
 
     def _limpiar_alta_por_retiro(self) -> None:
-        if not isinstance(self.current_ui, AltaWindow):
+        if not isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             return
 
         if self.alta_pendiente:
@@ -2098,6 +2558,8 @@ class AppController:
 
         if hasattr(ui, "textouid"):
             ui.textouid.setText(self.uid_sustituir_original or "-")        
+        if hasattr(ui, "textouidnuevo"):
+            ui.textouidnuevo.clear()
         
         
         
@@ -2132,8 +2594,12 @@ class AppController:
         ui.textouid.setText("-")
         ui.textotipo.setText("-")
         ui.textovigencia.clear()
+        if hasattr(ui, "textouidnuevo"):
+            ui.textouidnuevo.setReadOnly(True)
+            ui.textouidnuevo.clear()
         ui.textovigencia.setReadOnly(True)
         ui.botonsustituir.clicked.connect(self._ejecutar_sustitucion)
+        ui.botonguardar_2.clicked.connect(self._limpiar_formulario_sustituir)
         
         self._crear_popup_resultados_sustituir()
         self._activar_busqueda_sustituir_al_presionar()
@@ -2180,56 +2646,7 @@ class AppController:
         ui = self.current_ui
         ui.buscador.setPlaceholderText("Buscar por nombre, UID, o Curp...")
         
-        ui.buscador.setStyleSheet(
-            """
-            QLineEdit#buscador {
-            background-color: white;
-            border: 2px solid #B7DDF5;
-            color: #2e3a46;
-            border-radius: 10px;
-            padding: 5px 12px;
-            font-size: 12px;
-        }
-
-        QLineEdit#buscador:focus {
-            border: 2px solid #1E73BE;
-            background-color: #F8FCFF;
-        }
-            """
-            )
         
-        ui.lista.setStyleSheet("""
-        QComboBox#lista {
-            background-color: white;
-            border: 2px solid #B7DDF5;
-            color: #2e3a46;
-            border-radius: 10px;
-            padding: 6px 12px;
-            font-weight: bold;
-        }
-
-        QComboBox#lista:focus {
-            border: 2px solid #1E73BE;
-        }
-
-        QComboBox#lista::drop-down {
-            width: 32px;
-            border-left: 1px solid #B7DDF5;
-            background-color: #D9ECFF;
-            border-top-right-radius: 10px;
-            border-bottom-right-radius: 10px;
-        }
-
-        QComboBox#lista QAbstractItemView {
-            background-color: white;
-            color: #2e3a46;
-            border: 2px solid #7BB7F0;
-            selection-background-color: #F4C430;
-            selection-color: #3e3a32;
-            padding: 4px;
-            outline: 0;
-        }
-    """)
         
         
             
@@ -2272,56 +2689,21 @@ class AppController:
             header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
             header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
 
-            self.popup_resultados_sustituir.setStyleSheet("""
-                QTableWidget#tablaResultadosSustituir {
-                    background-color: white;
-                    alternate-background-color: #F8FCFF;
-                    color: #2e3a46;
-                    border: 2px solid #7BB7F0;
-                    border-radius: 10px;
-                    gridline-color: #D9ECFF;
-                    font-size: 11px;
-                    selection-background-color: #F4C430;
-                    selection-color: #3e3a32;
-                }
-
-                QTableWidget#tablaResultadosSustituir::item {
-                    padding: 6px;
-                    border-bottom: 1px solid #EAF4FF;
-                }
-
-                QTableWidget#tablaResultadosSustituir::item:selected {
-                    background-color: #F4C430;
-                    color: #3e3a32;
-                    font-weight: bold;
-                }
-
-                QHeaderView::section {
-                    background-color: #D9ECFF;
-                    color: #245e91;
-                    font-weight: bold;
-                    padding: 6px;
-                    border: none;
-                    border-bottom: 1px solid #7BB7F0;
-                }
-
-                QTableCornerButton::section {
-                    background-color: #D9ECFF;
-                    border: none;
-                }
-            """)
 
             self.popup_resultados_sustituir.hide()
 
-        geo = ui.buscador.geometry()
-        margen = 20
-        ancho_disponible = max(650, ui.centralwidget.width() - (margen * 2))
+        posicion = ui.buscador.mapTo(
+            ui.centralwidget, ui.buscador.rect().bottomLeft()
+        )
+        margen = 16
+        ancho_disponible = ui.centralwidget.width() - posicion.x() - margen
+        alto_disponible = ui.centralwidget.height() - posicion.y() - margen - 8
 
         self.popup_resultados_sustituir.setGeometry(
-            margen,
-            geo.y() + geo.height() + 6,
+            posicion.x(),
+            posicion.y() + 8,
             ancho_disponible,
-            260,
+            min(260, alto_disponible),
         )    
    
     def _formatear_vigencia_sustituir(self, vigencia_raw) -> str:
@@ -2365,7 +2747,9 @@ class AppController:
 
         try:
             self.resultados_sustituir = list(
-                self.sustituir_model.buscar_tarjetas_por_nombre(termino)
+                self.sustituir_model.buscar_tarjetas_por_nombre(
+                    termino, seccion=self.seccion_sustituir
+                )
             )
         except Exception as e:
             self.resultados_sustituir = []
@@ -2430,6 +2814,8 @@ class AppController:
         self.tarjeta_sustituir_seleccionada = dict(row)
         self.uid_sustituir_original = self._normalizar_uid(str(row.get('uid') or ''))
         self.uid_sustituir_nueva = ''
+        if hasattr(ui, "textouidnuevo"):
+            ui.textouidnuevo.clear()
 
         ui.buscador.blockSignals(True)
         ui.buscador.clear()
@@ -2484,12 +2870,32 @@ class AppController:
                         continue
                     self._registrar_uid_sustituir_leida(uid)
 
-                elif linea_minusculas.startswith('sldo,'):
-                    _, uid, _saldo, _nombre = linea.split(',', 3)
-                    uid = self._normalizar_uid(uid)
+                elif linea_minusculas.startswith("sldo,"):
+                    partes = linea.split(",", 3)
+
+                    if len(partes) < 4:
+                        continue
+
+                    uid = self._normalizar_uid(partes[1])
+
                     if not uid:
                         continue
+
                     self._registrar_uid_sustituir_leida(uid)
+
+                    pendiente = self.sustituir_pendiente
+
+                    if (
+                        pendiente
+                        and uid == pendiente["uid_nueva"]
+                        and pendiente.get("fase") in (
+                            "esperando_saldo",
+                            "verificando_saldo",
+                        )
+                    ):
+                        self._procesar_saldo_para_sustitucion(
+                            int(partes[2])
+                        )
                 
                 elif linea == "st":
                     self._limpiar_interfaz_por_retiro_tarjeta()
@@ -2498,6 +2904,9 @@ class AppController:
                 elif linea_minusculas == 'ok,alta':
                     if not self.sustituir_pendiente:
                         print('[SUSTITUIR] Llego ok,alta pero no hay sustitucion pendiente.')
+                        continue
+
+                    if self.sustituir_pendiente.get('fase') != 'esperando_alta':
                         continue
 
                     uid = self.sustituir_pendiente['uid_nueva']
@@ -2512,29 +2921,29 @@ class AppController:
                         print('[SUSTITUIR] Llego ok,nombre pero no hay sustitucion pendiente.')
                         continue
 
-                    if not self._guardar_sustitucion_confirmada():
-                        return
+                    if self.sustituir_pendiente.get('fase') == 'esperando_nombre':
+                        self._continuar_sustitucion_con_saldo()
 
-                    QMessageBox.information(
-                        self.current_window,
-                        'Sustituir',
-                        f'Tarjeta sustituida.\nNueva: {self.uid_sustituir_nueva}'
-                    )
-                    self._limpiar_formulario_sustituir()
+                elif linea_minusculas == "ok":
+                    pendiente = self.sustituir_pendiente
 
-                elif linea == 'ok':
-                    if not self.sustituir_pendiente:
+                    if not pendiente:
                         continue
 
-                    if not self._guardar_sustitucion_confirmada():
-                        return
+                    if pendiente.get("fase") in (
+                        "esperando_alta",
+                        "esperando_nombre",
+                    ):
+                        self._continuar_sustitucion_con_saldo()
 
-                    QMessageBox.information(
-                        self.current_window,
-                        'Sustituir',
-                        f'Tarjeta sustituida.\nNueva: {self.uid_sustituir_nueva}'
-                    )
-                    self._limpiar_formulario_sustituir()
+                elif linea_minusculas.startswith('ok,'):
+                    pendiente = self.sustituir_pendiente
+                    partes = linea.split(',')
+                    if (pendiente and pendiente.get('fase') == 'verificando_saldo'
+                            and len(partes) >= 4
+                            and self._normalizar_uid(partes[1]) == pendiente['uid_nueva']):
+                        # La respuesta de escritura no sustituye la lectura física.
+                        self._verificar_saldo_sustitucion(pendiente)
 
                 elif linea_minusculas.startswith('error'):
 
@@ -2552,7 +2961,8 @@ class AppController:
                         continue
 
                     if 'error en las 3 aplicaciones' in linea_minusculas:
-                        if self.sustituir_pendiente:
+                        if (self.sustituir_pendiente
+                                and self.sustituir_pendiente.get('fase') == 'esperando_alta'):
                             reintentos = self.sustituir_pendiente.get('reintentos_alta', 0)
                             comando = self.sustituir_pendiente.get('comando_sustitucion')
 
@@ -2566,12 +2976,22 @@ class AppController:
 
                                 QTimer.singleShot(
                                     1000,
-                                    lambda c=comando: self.arduino.enviar_linea(c)
+                                    lambda c=comando, p=self.sustituir_pendiente: (
+                                        self.arduino.enviar_linea(c)
+                                        if self.sustituir_pendiente is p
+                                        and p.get('fase') == 'esperando_alta'
+                                        else None
+                                    )
                                 )
                                 continue
 
                     if not self.sustituir_pendiente:
                         print(f'[SUSTITUIR] Error de lectura ignorado sin sustitucion pendiente: {linea}')
+                        continue
+
+                    if self.sustituir_pendiente.get('fase') in (
+                            'esperando_saldo', 'verificando_saldo', 'guardando_local'):
+                        self._verificar_saldo_sustitucion(self.sustituir_pendiente)
                         continue
 
                     self.sustituir_pendiente = None
@@ -2599,7 +3019,10 @@ class AppController:
 
         self.uid_sustituir_nueva = uid
         if isinstance(self.current_ui, SustituirWindow):
-            self.current_ui.textouid.setText(uid)
+            if hasattr(self.current_ui, "textouidnuevo"):
+                self.current_ui.textouidnuevo.setText(uid)
+            else:
+                self.current_ui.textouid.setText(uid)
 
     def _esperar_uid_sustituir_disponible(self) -> bool:
         try:
@@ -2620,120 +3043,237 @@ class AppController:
         if not isinstance(self.current_ui, SustituirWindow):
             return
 
-        if not self.tarjeta_sustituir_seleccionada or not self.uid_sustituir_original:
-            QMessageBox.warning(
-                self.current_window,
-                'Error',
-                'Primero selecciona un pasajero del buscador.'
-            )
-            return
+        from core.carga import cargando
+        with cargando(self.current_window, "Guardando sustitución de tarjeta…",
+                      pendiente=lambda: self.sustituir_pendiente is not None):
+            if self.sustituir_pendiente:
+                self._verificar_saldo_sustitucion(self.sustituir_pendiente)
+                return
 
-        self.uid_sustituir_original = self._normalizar_uid(self.uid_sustituir_original)
-        self.uid_sustituir_nueva = ''
-        self._leer_serial_sustituir(False)
-        if not self.uid_sustituir_nueva and not self._esperar_uid_sustituir_disponible():
-            QMessageBox.warning(
-                self.current_window,
-                'Error',
-                'Acerca la tarjeta nueva al lector.'
-            )
-            return
+            if not self.tarjeta_sustituir_seleccionada or not self.uid_sustituir_original:
+                QMessageBox.warning(
+                    self.current_window,
+                    'Error',
+                    'Primero selecciona un pasajero del buscador.'
+                )
+                return
 
-        if self._normalizar_uid(self.uid_sustituir_nueva) == self.uid_sustituir_original:
-            QMessageBox.warning(
-                self.current_window,
-                'Error',
-                'La tarjeta nueva no puede ser la misma que la anterior.'
-            )
-            return
+            self.uid_sustituir_original = self._normalizar_uid(self.uid_sustituir_original)
+            self.uid_sustituir_nueva = ''
+            self._leer_serial_sustituir(False)
+            if not self.uid_sustituir_nueva and not self._esperar_uid_sustituir_disponible():
+                QMessageBox.warning(
+                    self.current_window,
+                    'Error',
+                    'Acerca la tarjeta nueva al lector.'
+                )
+                return
 
-        fecha = self.current_ui.calendario.selectedDate()
-        vigtarifa = fecha.toString('ddMMyy')
-        hora_actual = QDateTime.currentDateTime().toString('HHmmss')
-        nueva_vigencia = vigtarifa + hora_actual
+            if self._normalizar_uid(self.uid_sustituir_nueva) == self.uid_sustituir_original:
+                QMessageBox.warning(
+                    self.current_window,
+                    'Error',
+                    'La tarjeta nueva no puede ser la misma que la anterior.'
+                )
+                return
 
-        if len(vigtarifa) != 6 or not vigtarifa.isdigit():
-            QMessageBox.warning(
-                self.current_window,
-                'Error',
-                'VIGTARIFA invalida.'
-            )
-            return
+            fecha = self.current_ui.calendario.selectedDate()
+            vigtarifa = fecha.toString('ddMMyy')
+            hora_actual = QDateTime.currentDateTime().toString('HHmmss')
+            nueva_vigencia = vigtarifa + hora_actual
 
-        if len(nueva_vigencia) != 12 or not nueva_vigencia.isdigit():
-            QMessageBox.warning(
-                self.current_window,
-                'Error',
-                'VIGENCIA12 invalida.'
-            )
-            return
+            if len(vigtarifa) != 6 or not vigtarifa.isdigit():
+                QMessageBox.warning(
+                    self.current_window,
+                    'Error',
+                    'VIGTARIFA invalida.'
+                )
+                return
 
-        row = dict(self.tarjeta_sustituir_seleccionada)
-        nombre_tarjeta = self._limpiar_alias_para_arduino(row.get('nombre_pasajero') or '')
+            if len(nueva_vigencia) != 12 or not nueva_vigencia.isdigit():
+                QMessageBox.warning(
+                    self.current_window,
+                    'Error',
+                    'VIGENCIA12 invalida.'
+                )
+                return
 
-        if not nombre_tarjeta:
-            QMessageBox.warning(
-                self.current_window,
-                'Error',
-                'La tarjeta seleccionada no tiene nombre valido para copiar.'
-            )
-            return
-
-        tipo_tarjeta_raw = str(row.get('tipo_tarjeta') or '').strip().lower()
-        if 'prefer' in tipo_tarjeta_raw:
-            no_tarjeta = 'EU'
-            tipo_local = 'EU'
-        else:
-            no_tarjeta = 'NO'
-            tipo_local = 'NO'
-
-        try:
-            nombre_tarjeta = self._ajustar_alias_para_comando_alta(
-                self.uid_sustituir_nueva,
-                nombre_tarjeta,
-                no_tarjeta,
-                '02',
-                '01',
-                vigtarifa,
-                nueva_vigencia,
-            )
+            row = dict(self.tarjeta_sustituir_seleccionada)
+            nombre_tarjeta = self._limpiar_alias_para_arduino(row.get('nombre_pasajero') or '')
 
             if not nombre_tarjeta:
                 QMessageBox.warning(
                     self.current_window,
                     'Error',
-                    'El nombre queda vacio al preparar el comando para Arduino.'
+                    'La tarjeta seleccionada no tiene nombre valido para copiar.'
                 )
                 return
 
-            comando = (
-                f'al,{self.uid_sustituir_nueva},{nombre_tarjeta},{no_tarjeta},'
-                f'02,01,{vigtarifa},{nueva_vigencia}'
+            tipo_tarjeta_raw = str(
+                row.get("tipo_tarjeta") or ""
+            ).strip().lower()
+
+            if tipo_tarjeta_raw == "de" or "despachador" in tipo_tarjeta_raw:
+                no_tarjeta = "DE"
+                tipo_local = "DE"
+            elif (
+                "operador" in tipo_tarjeta_raw
+                or tipo_tarjeta_raw in ("ki", "ope")
+            ):
+                no_tarjeta = "KI"
+                tipo_local = "KI"
+            elif (
+                "prefer" in tipo_tarjeta_raw
+                or tipo_tarjeta_raw == "eu"
+            ):
+                no_tarjeta = "EU"
+                tipo_local = "EU"
+            else:
+                no_tarjeta = "NO"
+                tipo_local = "NO"
+
+            try:
+                from decimal import Decimal
+
+                objetivo = (
+                    0
+                    if tipo_local in ("KI", "DE")
+                    else int(
+                        (
+                            Decimal(str(row.get("saldo") or 0)) * 100
+                        ).quantize(Decimal("1"))
+                    )
+                )
+
+                if not 0 <= objetivo <= 40000:
+                    raise ValueError(
+                        "El saldo a transferir debe estar entre $0 y $400."
+                    )
+
+                self.sustituir_model.validar_sustitucion_local(
+                    self.uid_sustituir_original,
+                    self.uid_sustituir_nueva,
+                )
+
+                nombre_tarjeta = self._ajustar_alias_para_comando_alta(
+                    self.uid_sustituir_nueva,
+                    nombre_tarjeta,
+                    no_tarjeta,
+                    '02',
+                    '01',
+                    vigtarifa,
+                    nueva_vigencia,
+                )
+
+                if not nombre_tarjeta:
+                    QMessageBox.warning(
+                        self.current_window,
+                        'Error',
+                        'El nombre queda vacio al preparar el comando para Arduino.'
+                    )
+                    return
+
+                comando = (
+                    f'al,{self.uid_sustituir_nueva},{nombre_tarjeta},{no_tarjeta},'
+                    f'02,01,{vigtarifa},{nueva_vigencia}'
+                )
+
+                self.sustituir_pendiente = {
+                    'uid_anterior': self.uid_sustituir_original,
+                    'uid_nueva': self.uid_sustituir_nueva,
+                    'nombre_pasajero': nombre_tarjeta,
+                    'tipo_codigo_local': tipo_local,
+                    'nueva_vigencia': nueva_vigencia,
+                    'fase': 'esperando_alta',
+                    'comando_sustitucion': comando,
+                    'reintentos_alta': 0,
+                    'saldo_objetivo_centavos': objetivo,
+                    'datos_original': row,
+                }
+
+                print('[SUSTITUIR] Enviando sustitucion:', comando)
+                self.arduino.enviar_linea(comando)
+
+            except Exception as e:
+                self.sustituir_pendiente = None
+                print(f'[SUSTITUIR] Error completo al enviar sustitucion: {e}')
+                traceback.print_exception(type(e), e, e.__traceback__)
+                QMessageBox.critical(
+                    self.current_window,
+                    'Error',
+                    f'No se pudo enviar la sustitucion: {e}'
+                )
+
+    def _continuar_sustitucion_con_saldo(self) -> None:
+        pendiente = self.sustituir_pendiente
+        if not pendiente:
+            return
+        if pendiente['tipo_codigo_local'] in ('KI', 'DE'):
+            self._finalizar_sustitucion_local()
+            return
+        pendiente['fase'] = 'esperando_saldo'
+        self._verificar_saldo_sustitucion(pendiente)
+
+    def _procesar_saldo_para_sustitucion(self, saldo_centavos: int) -> None:
+        pendiente = self.sustituir_pendiente
+        if not pendiente:
+            return
+        objetivo = pendiente['saldo_objetivo_centavos']
+        if saldo_centavos == objetivo:
+            pendiente['saldo_verificado'] = True
+            self._finalizar_sustitucion_local()
+            return
+        if pendiente.get('escritura_saldo_enviada'):
+            # Una lectura diferente no prueba que un comando anterior no siga
+            # en ejecución. Nunca repetir una recarga de resultado incierto.
+            return
+        if not 0 <= saldo_centavos < objetivo:
+            return
+        pendiente['escritura_saldo_enviada'] = True
+        pendiente['fase'] = 'verificando_saldo'
+        self.arduino.enviar_linea(
+            f"rc,{pendiente['uid_nueva']},{objetivo - saldo_centavos}"
+        )
+        QTimer.singleShot(1500, lambda p=pendiente: self._verificar_saldo_sustitucion(p))
+
+    def _verificar_saldo_sustitucion(self, pendiente=None) -> None:
+        pendiente = pendiente or self.sustituir_pendiente
+        if not pendiente or self.sustituir_pendiente is not pendiente:
+            return
+        if pendiente.get('fase') == 'guardando_local':
+            self._finalizar_sustitucion_local()
+            return
+        if pendiente.get('fase') not in ('esperando_saldo', 'verificando_saldo'):
+            return
+        # Se utiliza la lectura automática sldo del lector. No se inventa un
+        # comando de consulta que el firmware actual pueda no soportar.
+        if not pendiente.get('aviso_verificacion_programado'):
+            pendiente['aviso_verificacion_programado'] = True
+            def avisar():
+                if self.sustituir_pendiente is pendiente:
+                    QMessageBox.warning(
+                        self.current_window, 'Sustituir',
+                        'Sustitución pendiente de comprobar el saldo o guardar en SQLite. '
+                        'Retira y acerca la tarjeta nueva para leer su saldo. '
+                        'No repitas el alta ni la recarga. No cierres la aplicación: '
+                        'la escritura física y SQLite no forman una transacción única.'
+                    )
+            QTimer.singleShot(8000, avisar)
+
+    def _finalizar_sustitucion_local(self) -> None:
+        pendiente = self.sustituir_pendiente
+        if not pendiente:
+            return
+        if pendiente['tipo_codigo_local'] not in ('KI', 'DE') and not pendiente.get('saldo_verificado'):
+            return
+        pendiente['fase'] = 'guardando_local'
+        if self._guardar_sustitucion_confirmada():
+            QMessageBox.information(
+                self.current_window, 'Sustituir',
+                f"Tarjeta sustituida localmente.\nNueva: {pendiente['uid_nueva']}\n"
+                'Sincronización pendiente de confirmación del servidor.'
             )
-
-            self.sustituir_pendiente = {
-                'uid_anterior': self.uid_sustituir_original,
-                'uid_nueva': self.uid_sustituir_nueva,
-                'nombre_pasajero': nombre_tarjeta,
-                'tipo_codigo_local': tipo_local,
-                'nueva_vigencia': nueva_vigencia,
-                'fase': 'esperando_alta',
-                'comando_sustitucion': comando,
-                'reintentos_alta': 0,
-            }
-
-            print('[SUSTITUIR] Enviando sustitucion:', comando)
-            self.arduino.enviar_linea(comando)
-
-        except Exception as e:
-            self.sustituir_pendiente = None
-            print(f'[SUSTITUIR] Error completo al enviar sustitucion: {e}')
-            traceback.print_exception(type(e), e, e.__traceback__)
-            QMessageBox.critical(
-                self.current_window,
-                'Error',
-                f'No se pudo enviar la sustitucion: {e}'
-            )
+            self._limpiar_formulario_sustituir()
 
     def _guardar_sustitucion_confirmada(self) -> bool:
         if not self.sustituir_pendiente:
@@ -2746,16 +3286,18 @@ class AppController:
                 'nueva_vigencia': self.sustituir_pendiente['nueva_vigencia'],
                 'nombre_pasajero': self.sustituir_pendiente['nombre_pasajero'],
                 'tipo_codigo_local': self.sustituir_pendiente['tipo_codigo_local'],
+                'datos_original': self.sustituir_pendiente['datos_original'],
             }
 
-            self.sustituir_model.sustituir_tarjeta_servidor(**payload)
+            self.sustituir_model.guardar_sustitucion_local(**payload)
 
             print(
-                '[SUSTITUIR] Sustitucion guardada en SERVIDOR '
+                '[SUSTITUIR] Sustitucion guardada en SQLite '
                 f"UID_ANTERIOR={payload['uid_anterior']} UID_NUEVA={payload['uid_nueva']}"
             )
 
             self.sustituir_pendiente = None
+            self._sincronizar_pendientes()
             return True
 
         except Exception as e:
@@ -2764,7 +3306,8 @@ class AppController:
             QMessageBox.critical(
                 self.current_window,
                 'Error',
-                f'El Arduino confirmo la sustitucion, pero no se pudo guardar en el servidor: {e}'
+                f'La tarjeta fue escrita, pero no se pudo guardar en SQLite: {e}. '
+                'No cierres la aplicación ni repitas la recarga. Vuelve a presionar Sustituir para guardar.'
             )
             return False
 
@@ -2784,6 +3327,8 @@ class AppController:
         self.current_ui.textofecha.setText('-')
         self.current_ui.textouid.setText('-')
         self.current_ui.textotipo.setText('-')
+        if hasattr(self.current_ui, "textouidnuevo"):
+            self.current_ui.textouidnuevo.clear()
         self._actualizar_vigencia_sustituir_desde_calendario()
         self._ocultar_popup_sustituir()
         
@@ -2801,26 +3346,6 @@ class AppController:
         ui.usuario.setArrowType(Qt.ArrowType.NoArrow)
 
         menu = QMenu(self.current_window)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: white;
-                border: 1px solid #D6E4F2;
-                border-radius: 8px;
-                padding: 6px;
-            }
-
-            QMenu::item {
-                color: #245E91;
-                padding: 8px 18px;
-                border-radius: 6px;
-                font: 700 9pt "Arial";
-            }
-
-            QMenu::item:selected {
-                background-color: #F4C430;
-                color: #245E91;
-            }
-        """)
 
         accion_cerrar = menu.addAction("Cerrar sesión")
         accion_cerrar.triggered.connect(self._cerrar_sesion)
@@ -2883,7 +3408,7 @@ class AppController:
     #----------------------------------------------
     
     def _limitar_curp_alta(self) -> None:
-        if not isinstance(self.current_ui, AltaWindow):
+        if not isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             return
 
         campo = self.current_ui.textocurp
@@ -2903,7 +3428,7 @@ class AppController:
 #---------------------------------------------------
 
     def _solo_letras_espacios_nombre_alta(self) -> None:
-        if not isinstance(self.current_ui, AltaWindow):
+        if not isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             return
         
         campo = self.current_ui.textonombre
@@ -2931,7 +3456,7 @@ class AppController:
 #               FECHA NACIMINETO(DD-MM-AAAA)
 #--------------------------------------------------
     def _formatear_fecha_nacimiento_alta(self) -> None:
-        if not isinstance(self.current_ui, AltaWindow):
+        if not isinstance(self.current_ui, (AltaWindow, Ui_AltaOWindow)):
             return
         
         campo = self.current_ui.textofechanacimiento
@@ -3048,4 +3573,4 @@ class AppController:
             
         if texto_actual == "Recarga Exitosa":
             ui.texto7.clear()
-            ui.texto7.setStyleSheet("")
+            ui.texto7.setProperty("estadoVisual", "")

@@ -1,6 +1,10 @@
 from datetime import datetime
 from time import monotonic
 
+import json
+
+from core.lista_negra_local import bloqueo_local
+
 import requests
 
 from core.database import get_connection
@@ -30,42 +34,47 @@ class RecargaModel:
         
     def obtener_tarjeta_por_uid(self, uid: str):
         uid = (uid or "").strip().upper()
+
         if not uid:
             return None
 
         tarjeta_local = self._obtener_tarjeta_local_por_uid(uid)
 
-        tarjeta_servidor = self._obtener_tarjeta_servidor_por_uid(uid)
-        if tarjeta_servidor:
-            return tarjeta_servidor
+        if tarjeta_local:
+            with get_connection() as connection:
+                pendiente = connection.execute(
+                    """
+                    SELECT 1 FROM sync_queue
+                    WHERE entity_uid = ?
+                      AND status IN ('pending', 'error', 'waiting_api')
+                    LIMIT 1
+                    """,
+                    (uid,),
+                ).fetchone()
 
-        return tarjeta_local
+            if tarjeta_local["en_lista_negra"] or pendiente:
+                return tarjeta_local
+
+        tarjeta_servidor = (
+            self._obtener_tarjeta_servidor_por_uid(uid)
+        )
+
+        return tarjeta_servidor or tarjeta_local
 
     def _obtener_tarjeta_local_por_uid(self, uid: str):
         with get_connection() as connection:
-            row = connection.execute(
+            tarjeta = connection.execute(
                 """
-                SELECT
-                    t.id,
-                    t.uid,
-                    t.saldo,
-                    t.vigencia,
-                    t.tipo_tarjeta_id,
-                    t.en_lista_negra,
-                    t.motivo_baja,
-                    tt.descripcion AS tipo_tarjeta,
-                    p.nombre AS nombre_pasajero
-                FROM tarjetas t
-                INNER JOIN tipo_tarjetas tt ON tt.id = t.tipo_tarjeta_id
-                INNER JOIN pasajeros p ON p.id = t.pasajero_id
-                WHERE t.uid = ?
+                SELECT * FROM v_tarjetas_locales
+                WHERE uid = ?
                 LIMIT 1
                 """,
                 (uid,),
             ).fetchone()
 
-            return row
-
+        return tarjeta or bloqueo_local(uid)
+    
+    
     def _obtener_tarjeta_servidor_por_uid(self, uid: str):
         if not self.base_url or not self.token:
             return None
@@ -129,15 +138,21 @@ class RecargaModel:
             return texto in {"1", "true", "si", "yes", "y"}
 
         tipo_tarjeta = str(
-            primero("tipo_tarjeta", "tipo", "tipo_descripcion", default="Normal")
+            primero("tipo_tarjeta", "tipo", "tipo_descripcion", "tipo_codigo_local", default="Normal")
         ).strip() or "Normal"
+        if tipo_tarjeta.upper() == "DE" or "despachador" in tipo_tarjeta.lower():
+            tipo_tarjeta = "Despachador"
 
         return {
             "uid": str(primero("uid", default="")).strip().upper(),
             "saldo": float(primero("saldo", "saldo_actual", default=0) or 0),
             "vigencia": primero("vigencia", "fecha_vigencia", default=None),
             "tipo_tarjeta": tipo_tarjeta,
-            "tipo_tarjeta_id": 2 if "prefer" in tipo_tarjeta.lower() else 1,
+            "tipo_tarjeta_id": (
+                primero("tipo_tarjeta_id", default=None)
+                if tipo_tarjeta == "Despachador"
+                else (2 if "prefer" in tipo_tarjeta.lower() else 1)
+            ),
             "nombre_pasajero": str(
                 primero("nombre_pasajero", "nombre", "pasajero", default="")
             ).strip(),
@@ -220,11 +235,85 @@ class RecargaModel:
         oficina: str = "",
         referencia: str | None = None,
     ):
-        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        nombre_final = (nombre_pasajero or "").strip() or f"Tarjeta {uid[-4:]}"
+        uid = (uid or "").strip().upper()
+
+        created_at = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        nombre_final = (
+            (nombre_pasajero or "").strip()
+            or f"Tarjeta {uid[-4:]}"
+        )
 
         with get_connection() as connection:
-            usuario_id = self._obtener_usuario_id(connection, username)
+            connection.execute('BEGIN IMMEDIATE')
+            tarjeta = connection.execute(
+                """
+                SELECT
+                    tt.clave,
+                    tt.descripcion,
+                    t.en_lista_negra
+                FROM tarjetas t
+                JOIN tipo_tarjetas tt
+                    ON tt.id = t.tipo_tarjeta_id
+                WHERE UPPER(t.uid) = ?
+                LIMIT 1
+                """,
+                (uid,),
+            ).fetchone()
+
+            if tarjeta:
+                clave = str(tarjeta["clave"] or "").lower()
+                descripcion = str(
+                    tarjeta["descripcion"] or ""
+                ).lower()
+
+                if (
+                    clave in {"ki", "ope", "operador", "de", "despachador"}
+                    or "operador" in descripcion
+                    or "despachador" in descripcion
+                ):
+                    raise ValueError(
+                        "Las tarjetas de Despachador no admiten recargas."
+                        if clave in {"de", "despachador"} or "despachador" in descripcion
+                        else "Las tarjetas de operador no admiten recargas."
+                    )
+                if tarjeta["en_lista_negra"]:
+                    raise ValueError(
+                        "La tarjeta está en lista negra."
+                    )
+
+            if bloqueo_local(uid):
+                pendiente = connection.execute(
+                    """
+                    SELECT payload_json
+                    FROM sync_queue
+                    WHERE entity_uid = ?
+                      AND event_type = 'cancelacion_tarjeta'
+                      AND status IN ('pending', 'error')
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (uid,),
+                ).fetchone()
+
+                reactivada_localmente = (
+                    pendiente is not None
+                    and not json.loads(
+                        pendiente["payload_json"]
+                    ).get("en_lista_negra", True)
+                )
+
+                if not reactivada_localmente:
+                    raise ValueError(
+                        "La tarjeta está en lista negra."
+                    )
+
+            usuario_id = self._obtener_usuario_id(
+                connection,
+                username,
+            )
 
             tarjeta_id = self._asegurar_tarjeta_local(
                 connection=connection,
@@ -233,15 +322,27 @@ class RecargaModel:
                 saldo_actual=nuevo_saldo,
             )
 
-            connection.execute(
+            recarga_id = connection.execute(
                 """
-                INSERT INTO recargas (tarjeta_id, usuario_id, monto, oficina, referencia)
+                INSERT INTO recargas (
+                    tarjeta_id,
+                    usuario_id,
+                    monto,
+                    oficina,
+                    referencia
+                )
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (tarjeta_id, usuario_id, monto, oficina, referencia),
-            )
+                (
+                    tarjeta_id,
+                    usuario_id,
+                    monto,
+                    oficina,
+                    referencia,
+                ),
+            ).lastrowid
 
-            enqueue_sync_event(
+            operation_uuid = enqueue_sync_event(
                 connection,
                 event_type="recarga_tarjeta",
                 entity_uid=uid,
@@ -256,4 +357,12 @@ class RecargaModel:
                     "referencia": referencia,
                     "local_created_at": created_at,
                 },
+            )
+
+            connection.execute(
+                """
+                UPDATE recargas SET sync_uuid = ?
+                WHERE id = ?
+                """,
+                (operation_uuid, recarga_id),
             )

@@ -1,6 +1,6 @@
-SYNC_API_BASE_URL = "http://158.23.58.52"
+#SYNC_API_BASE_URL = "http://158.23.58.52"
 #laravel
-#SYNC_API_BASE_URL = "http://127.0.0.1:8000"
+SYNC_API_BASE_URL = "http://127.0.0.1:8000"
 SYNC_API_TOKEN = "9f2d7c1a4b6e8f0c3d5a7b9e1f4c6d8a2b5e7c9f1a3d6b8c0e2f4a6c8d1b3e5"
 SYNC_PING_PATH = "/api/desktop-sync/ping"
 SYNC_BATCH_PATH = "/api/desktop-sync/batch"

@@ -25,17 +25,28 @@ class AltaModel:
         with get_connection() as connection:
             return connection.execute(
                 """
-                SELECT 
-                    p.id,
-                    p.nombre,
-                    p.curp,
-                    t.uid
+                SELECT p.id, p.nombre, p.curp, t.uid
                 FROM pasajeros p
                 LEFT JOIN tarjetas t ON t.pasajero_id = p.id
                 WHERE UPPER(TRIM(p.curp)) = ?
+
+                UNION ALL
+
+                SELECT o.id, o.nombre, o.curp, t.uid
+                FROM operadores o
+                JOIN tarjetas t ON t.id = o.tarjeta_id
+                WHERE UPPER(TRIM(o.curp)) = ?
+
+                UNION ALL
+
+                SELECT d.id, d.nombre, d.curp, t.uid
+                FROM despachadores d
+                JOIN tarjetas t ON t.id = d.tarjeta_id
+                WHERE UPPER(TRIM(d.curp)) = ?
+
                 LIMIT 1
                 """,
-                (curp,),
+                (curp, curp, curp),
             ).fetchone()
 
     def buscar_curp_servidor(self, curp: str):
@@ -52,14 +63,17 @@ class AltaModel:
                 "Authorization": f"Bearer {SYNC_API_TOKEN}",
                 "X-Desktop-Sync-Token": SYNC_API_TOKEN,
             },
-            timeout=(SYNC_CONNECT_TIMEOUT_SECONDS, SYNC_READ_TIMEOUT_SECONDS),
+            timeout=(
+                SYNC_CONNECT_TIMEOUT_SECONDS,
+                SYNC_READ_TIMEOUT_SECONDS,
+            ),
         )
 
         response.raise_for_status()
-        data = response.json()
+        datos = response.json()
 
-        if data.get("exists"):
-            return data.get("pasajero") or {"curp": curp}
+        if datos.get("exists"):
+            return datos.get("pasajero") or {"curp": curp}
 
         return None
 
@@ -71,94 +85,104 @@ class AltaModel:
         vigencia: str,
         curp: str = "",
         fecha_nacimiento="",
-        foto: str = ""
+        foto: str = "",
     ):
+        uid = (uid or "").strip().upper()
+        tipo = (tipo or "NO").strip().upper()
         curp = self.normalizar_curp(curp)
+        nombre = (nombre_pasajero or "").strip()
 
-        if not curp or curp == "-":
-            raise ValueError("Captura la CURP.")
+        if not uid or not nombre or not curp or curp == "-":
+            raise ValueError("Captura UID, nombre y CURP.")
 
-        curp_existe = self.buscar_curp_local(curp)
-        if curp_existe:
-            raise ValueError(
-                f"La CURP {curp} ya existe en la base local. "
-               
-            )
-
-        tipo_tarjeta_id = 2 if tipo == "EU" else 1
-        nombre_final = (nombre_pasajero or "").strip()
-
-        if not nombre_final:
-            nombre_final = f"Tarjeta {uid[-4:]}"
-
-        documento_auto = "-"
-        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if tipo not in {"NO", "EU", "KI", "DE"}:
+            raise ValueError("Tipo de tarjeta no válido.")
 
         with get_connection() as connection:
-            tarjeta = connection.execute(
+            connection.execute("BEGIN IMMEDIATE")
+
+            if connection.execute(
+                "SELECT 1 FROM tarjetas WHERE UPPER(uid) = ?",
+                (uid,),
+            ).fetchone():
+                raise ValueError(
+                    "La tarjeta ya existe. Usa sustitución "
+                    "si corresponde."
+                )
+
+            if connection.execute(
                 """
-                SELECT id, pasajero_id
-                FROM tarjetas
-                WHERE uid = ?
+                SELECT 1 FROM pasajeros
+                WHERE UPPER(TRIM(curp)) = ?
+                UNION ALL
+                SELECT 1 FROM operadores
+                WHERE UPPER(TRIM(curp)) = ?
+                UNION ALL
+                SELECT 1 FROM despachadores
+                WHERE UPPER(TRIM(curp)) = ?
                 LIMIT 1
                 """,
-                (uid,),
-            ).fetchone()
+                (curp, curp, curp),
+            ).fetchone():
+                raise ValueError(
+                    "La CURP ya existe en la base local."
+                )
 
-            if tarjeta:
-                connection.execute(
+            clave = {
+                "KI": "operador",
+                "EU": "preferencial",
+                "NO": "normal",
+                "DE": "despachador",
+            }[tipo]
+
+            tipo_id = connection.execute(
+                "SELECT id FROM tipo_tarjetas WHERE clave = ?",
+                (clave,),
+            ).fetchone()[0]
+
+            pasajero_id = None
+
+            if tipo not in ("KI", "DE"):
+                pasajero_id = connection.execute(
                     """
-                    UPDATE pasajeros
-                    SET nombre = ?, documento = ?, curp = ?, foto = ?, fecha_nacimiento = ?
-                    WHERE id = ?
+                    INSERT INTO pasajeros (
+                        nombre, documento, curp,
+                        foto, fecha_nacimiento
+                    )
+                    VALUES (?, '-', ?, ?, ?)
+                    """,
+                    (nombre, curp, foto, fecha_nacimiento),
+                ).lastrowid
+
+            tarjeta_id = connection.execute(
+                """
+                INSERT INTO tarjetas (
+                    uid, saldo, tipo_tarjeta_id,
+                    pasajero_id, vigencia
+                )
+                VALUES (?, 0, ?, ?, ?)
+                """,
+                (uid, tipo_id, pasajero_id, vigencia),
+            ).lastrowid
+
+            if tipo in ("KI", "DE"):
+                tabla = "despachadores" if tipo == "DE" else "operadores"
+                connection.execute(
+                    f"""
+                    INSERT INTO {tabla} (
+                        tarjeta_id, nombre, documento,
+                        curp, foto, fecha_nacimiento
+                    )
+                    VALUES (?, ?, '-', ?, ?, ?)
                     """,
                     (
-                        nombre_final,
-                        documento_auto,
+                        tarjeta_id,
+                        nombre,
                         curp,
                         foto,
                         fecha_nacimiento,
-                        tarjeta["pasajero_id"],
                     ),
                 )
-
-                connection.execute(
-                    """
-                    UPDATE tarjetas
-                    SET saldo = ?, tipo_tarjeta_id = ?, vigencia = ?
-                    WHERE id = ?
-                    """,
-                    (0.0, tipo_tarjeta_id, vigencia, tarjeta["id"]),
-                )
-
-                tarjeta_id = tarjeta["id"]
-
-            else:
-                cursor_pasajero = connection.execute(
-                    """
-                    INSERT INTO pasajeros (nombre, documento, curp, foto, fecha_nacimiento)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        nombre_final,
-                        documento_auto,
-                        curp,
-                        foto,
-                        fecha_nacimiento,
-                    ),
-                )
-
-                pasajero_id = cursor_pasajero.lastrowid
-
-                cursor_tarjeta = connection.execute(
-                    """
-                    INSERT INTO tarjetas (uid, saldo, tipo_tarjeta_id, pasajero_id, vigencia)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (uid, 0.0, tipo_tarjeta_id, pasajero_id, vigencia),
-                )
-
-                tarjeta_id = cursor_tarjeta.lastrowid
 
             enqueue_sync_event(
                 connection,
@@ -166,15 +190,21 @@ class AltaModel:
                 entity_uid=uid,
                 payload={
                     "uid": uid,
-                    "saldo": 0.0,
-                    "nombre_pasajero": nombre_final,
-                    "documento": documento_auto,
+                    "saldo": 0,
+                    "nombre_pasajero": nombre,
+                    "documento": "-",
                     "curp": curp,
                     "foto": foto,
                     "fecha_nacimiento": fecha_nacimiento,
                     "tipo_codigo_local": tipo,
+                    "entidad": (
+                        "despachador" if tipo == "DE"
+                        else "operador" if tipo == "KI" else "pasajero"
+                    ),
                     "vigencia": vigencia,
-                    "local_created_at": created_at,
+                    "local_created_at": datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
                 },
             )
 

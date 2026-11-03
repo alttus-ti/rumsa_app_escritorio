@@ -3,7 +3,7 @@
 ################################################################################
 ## Form generated from reading UI file 'empleado.ui'
 ##
-## Created by: Qt User Interface Compiler version 6.11.0
+## Created by: Qt User Interface Compiler version 6.12.0
 ##
 ## WARNING! All changes made in this file will be lost when recompiling UI file!
 ################################################################################
@@ -15,268 +15,190 @@ from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
     QFont, QFontDatabase, QGradient, QIcon,
     QImage, QKeySequence, QLinearGradient, QPainter,
     QPalette, QPixmap, QRadialGradient, QTransform)
-from PySide6.QtWidgets import (QApplication, QFrame, QGridLayout, QHBoxLayout,
-    QLabel, QMainWindow, QPushButton, QSizePolicy,
+from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
+    QMainWindow, QPushButton, QScrollArea, QSizePolicy,
     QSpacerItem, QToolButton, QVBoxLayout, QWidget)
 
 class EmpleadoWindow(object):
     def setupUi(self, EmpleadoWindow):
         if not EmpleadoWindow.objectName():
             EmpleadoWindow.setObjectName(u"EmpleadoWindow")
-        EmpleadoWindow.resize(680, 680)
+        EmpleadoWindow.setMinimumSize(QSize(760, 680))
+        EmpleadoWindow.resize(860, 780)
         self.centralwidget = QWidget(EmpleadoWindow)
         self.centralwidget.setObjectName(u"centralwidget")
-        self.centralwidget.setStyleSheet(u"QWidget#centralwidget {\n"
-"    background-color: #EAF4FF;\n"
-"}\n"
-"QFrame#frameHeader {\n"
-"    background-color: #D7ECFF;\n"
-"    border: 2px solid #92BEE5;\n"
-"    border-radius: 18px;\n"
-"}\n"
-"QLabel#labelBrand {\n"
-"    color: #F0B51D;\n"
-"    font: 700 24pt \"Arial\";\n"
-"    letter-spacing: 2px;\n"
-"}\n"
-"QLabel#labelCompany {\n"
-"    color: #2E79BD;\n"
-"    font: 700 10pt \"Arial\";\n"
-"}\n"
-"QLabel#labelHeaderInfo {\n"
-"    color: #6C7B88;\n"
-"    font: 9pt \"Arial\";\n"
-"}\n"
-"QLabel#menu, QLabel#label, QLabel#Recargar, QLabel#alta {\n"
-"    color: #245E91;\n"
-"    font: 700 18pt \"Arial\";\n"
-"}\n"
-"QLabel#otrosdatos, QLabel#nombre, QLabel#uid, QLabel#tarjeta, QLabel#saldo, QLabel#saldonuevo, QLabel#vigencia {\n"
-"    color: #245E91;\n"
-"    font: 700 10pt \"Arial\";\n"
-"}\n"
-"QLabel#texto1, QLabel#texto2, QLabel#texto4, QLabel#texto5, QLabel#texto6, QLabel#texto7 {\n"
-"    color: #4B5560;\n"
-"    font: 10pt \"Arial\";\n"
-"}\n"
-"QLabel#signopeso, QLabel#signopeso2, QLabel#signopeso3 {\n"
-"    colo"
-                        "r: #F0B51D;\n"
-"    font: 700 16pt \"Arial\";\n"
-"}\n"
-"QPushButton {\n"
-"    background-color: #F4C430;\n"
-"    color: #3E3A32;\n"
-"    border: none;\n"
-"    border-radius: 12px;\n"
-"    padding: 10px 16px;\n"
-"    font: 700 10pt \"Arial\";\n"
-"}\n"
-"QPushButton:hover {\n"
-"    background-color: #E7B91C;\n"
-"}\n"
-"QPushButton#botonregresar {\n"
-"    background-color: #5FA8E8;\n"
-"    color: white;\n"
-"    border-radius: 12px;\n"
-"    padding: 0px;\n"
-"}\n"
-"QPushButton#botonregresar:hover {\n"
-"    background-color: #6CA8DB;\n"
-"}\n"
-"QLineEdit, QTextEdit, QTextBrowser, QComboBox, QCalendarWidget QAbstractItemView {\n"
-"    background-color: white;\n"
-"    color: #2E3A46;\n"
-"}\n"
-"QTextEdit, QTextBrowser, QComboBox, QCalendarWidget, QLineEdit {\n"
-"    border: 2px solid #B8D8F3;\n"
-"    border-radius: 12px;\n"
-"    padding: 6px 8px;\n"
-"}\n"
-"QTextEdit:focus, QComboBox:focus, QLineEdit:focus {\n"
-"    border: 2px solid #F3C623;\n"
-"}\n"
-"QRadioButton {\n"
-"    color: #4B5560;\n"
-"    font: 10pt \"Arial\";\n"
-""
-                        "}\n"
-"QRadioButton::indicator:checked {\n"
-"    background-color: #F4C430;\n"
-"    border: 2px solid #E0AE12;\n"
-"    width: 12px;\n"
-"    height: 12px;\n"
-"    border-radius: 7px;\n"
-"}\n"
-"QCalendarWidget QWidget {\n"
-"    alternate-background-color: #EAF4FF;\n"
-"}\n"
-"QCalendarWidget QToolButton {\n"
-"    color: #245E91;\n"
-"    font: 700 10pt \"Arial\";\n"
-"}\n"
-"QCalendarWidget QMenu {\n"
-"    background-color: white;\n"
-"}\n"
-"QCalendarWidget QSpinBox {\n"
-"    background-color: white;\n"
-"    color: #2E3A46;\n"
-"}\n"
-"QHeaderView::section {\n"
-"    background-color: #D7ECFF;\n"
-"    color: #245E91;\n"
-"    font: 700 9pt \"Arial\";\n"
-"    border: 1px solid #B8D8F3;\n"
-"}\n"
-"QPushButton#botonrecarga {\n"
-"    min-width: 220px;\n"
-"    min-height: 54px;\n"
-"    font: 700 12pt \"Arial\";\n"
-"}\n"
-"QLabel#labelEstadoConexion {\n"
-"    background-color: #FFF7D6;\n"
-"    color: #245E91;\n"
-"    border: 1px solid #F0C247;\n"
-"    border-radius: 10px;\n"
-"    padding: 4px 10px;\n"
-"    font: 700 8pt \"Arial\";"
-                        "\n"
-"}\n"
-"")
-        self.gridLayout = QGridLayout(self.centralwidget)
+        self.gridLayout = QVBoxLayout(self.centralwidget)
+        self.gridLayout.setSpacing(12)
         self.gridLayout.setObjectName(u"gridLayout")
-        self.horizontalLayout_2 = QHBoxLayout()
-        self.horizontalLayout_2.setObjectName(u"horizontalLayout_2")
-        self.horizontalSpacer_3 = QSpacerItem(500, 13, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
-
-        self.horizontalLayout_2.addItem(self.horizontalSpacer_3)
-
-        self.usuario = QToolButton(self.centralwidget)
-        self.usuario.setObjectName(u"usuario")
-        self.usuario.setMaximumSize(QSize(16777215, 40))
-        self.usuario.setStyleSheet(u"QToolButton {\n"
-"    background-color: transparent;\n"
-"    border: none;\n"
-"    color: #245E91;\n"
-"    padding: 0px;\n"
-"    margin: 0px;\n"
-"    font: 700 10pt \"Arial\";\n"
-"}\n"
-"\n"
-"QToolButton:hover {\n"
-"    color: #F4C430;\n"
-"    text-decoration: underline;\n"
-"}\n"
-"\n"
-"QToolButton:pressed {\n"
-"    background-color: #F4C430;\n"
-"    color: #245E91;\n"
-"    border-radius: 8px;\n"
-"    padding: 4px 8px;\n"
-"}")
-
-        self.horizontalLayout_2.addWidget(self.usuario)
-
-
-        self.gridLayout.addLayout(self.horizontalLayout_2, 0, 0, 1, 1)
-
-        self.verticalLayout = QVBoxLayout()
-        self.verticalLayout.setObjectName(u"verticalLayout")
+        self.gridLayout.setContentsMargins(16, 16, 16, 16)
         self.frameHeader = QFrame(self.centralwidget)
         self.frameHeader.setObjectName(u"frameHeader")
         self.frameHeader.setFrameShape(QFrame.StyledPanel)
         self.frameHeader.setFrameShadow(QFrame.Raised)
-        self.verticalLayout_header = QVBoxLayout(self.frameHeader)
-        self.verticalLayout_header.setSpacing(2)
-        self.verticalLayout_header.setObjectName(u"verticalLayout_header")
-        self.verticalLayout_header.setContentsMargins(16, 14, 16, 14)
-        self.labelBrand = QLabel(self.frameHeader)
+        self.frameHeader.setProperty(u"uiRole", u"header")
+        self.frameHeader.setMinimumSize(QSize(0, 90))
+        self.frameHeader.setMaximumSize(QSize(16777215, 90))
+        self.layoutEstructura2 = QHBoxLayout(self.frameHeader)
+        self.layoutEstructura2.setSpacing(12)
+        self.layoutEstructura2.setObjectName(u"layoutEstructura2")
+        self.layoutEstructura2.setContentsMargins(12, 12, 12, 12)
+        self.franjaCabecera = QFrame(self.frameHeader)
+        self.franjaCabecera.setObjectName(u"franjaCabecera")
+        self.franjaCabecera.setProperty(u"uiRole", u"stripe")
+        self.franjaCabecera.setMinimumSize(QSize(5, 32))
+        self.franjaCabecera.setMaximumSize(QSize(5, 32))
+
+        self.layoutEstructura2.addWidget(self.franjaCabecera, 0, Qt.AlignVCenter)
+
+        self.marcaCabecera = QWidget(self.frameHeader)
+        self.marcaCabecera.setObjectName(u"marcaCabecera")
+        self.layoutEstructura4 = QVBoxLayout(self.marcaCabecera)
+        self.layoutEstructura4.setSpacing(2)
+        self.layoutEstructura4.setObjectName(u"layoutEstructura4")
+        self.layoutEstructura4.setContentsMargins(0, 0, 0, 0)
+        self.labelBrand = QLabel(self.marcaCabecera)
         self.labelBrand.setObjectName(u"labelBrand")
-        self.labelBrand.setAlignment(Qt.AlignCenter)
+        self.labelBrand.setAlignment(Qt.AlignLeft|Qt.AlignVCenter)
+        self.labelBrand.setWordWrap(False)
+        sizePolicy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        sizePolicy.setHorizontalStretch(0)
+        sizePolicy.setVerticalStretch(0)
+        sizePolicy.setHeightForWidth(self.labelBrand.sizePolicy().hasHeightForWidth())
+        self.labelBrand.setSizePolicy(sizePolicy)
+        self.labelBrand.setProperty(u"uiRole", u"brand")
 
-        self.verticalLayout_header.addWidget(self.labelBrand)
+        self.layoutEstructura4.addWidget(self.labelBrand)
 
-        self.labelCompany = QLabel(self.frameHeader)
+        self.labelCompany = QLabel(self.marcaCabecera)
         self.labelCompany.setObjectName(u"labelCompany")
-        self.labelCompany.setAlignment(Qt.AlignCenter)
-        self.labelCompany.setWordWrap(True)
+        self.labelCompany.setAlignment(Qt.AlignLeft|Qt.AlignVCenter)
+        sizePolicy.setHeightForWidth(self.labelCompany.sizePolicy().hasHeightForWidth())
+        self.labelCompany.setSizePolicy(sizePolicy)
+        self.labelCompany.setProperty(u"uiRole", u"caption")
+        self.labelCompany.setWordWrap(False)
 
-        self.verticalLayout_header.addWidget(self.labelCompany)
+        self.layoutEstructura4.addWidget(self.labelCompany)
 
-        self.labelHeaderInfo = QLabel(self.frameHeader)
-        self.labelHeaderInfo.setObjectName(u"labelHeaderInfo")
-        self.labelHeaderInfo.setAlignment(Qt.AlignCenter)
 
-        self.verticalLayout_header.addWidget(self.labelHeaderInfo)
+        self.layoutEstructura2.addWidget(self.marcaCabecera)
 
-        self.labelEstadoConexion = QLabel(self.frameHeader)
+        self.espacioEstructura3 = QSpacerItem(8, 8, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+
+        self.layoutEstructura2.addItem(self.espacioEstructura3)
+
+        self.estadoCabecera = QWidget(self.frameHeader)
+        self.estadoCabecera.setObjectName(u"estadoCabecera")
+        self.layoutEstructura5 = QVBoxLayout(self.estadoCabecera)
+        self.layoutEstructura5.setSpacing(4)
+        self.layoutEstructura5.setObjectName(u"layoutEstructura5")
+        self.layoutEstructura5.setContentsMargins(0, 0, 0, 0)
+        self.usuario = QToolButton(self.estadoCabecera)
+        self.usuario.setObjectName(u"usuario")
+        self.usuario.setMinimumSize(QSize(0, 36))
+        self.usuario.setMaximumSize(QSize(16777215, 40))
+        sizePolicy.setHeightForWidth(self.usuario.sizePolicy().hasHeightForWidth())
+        self.usuario.setSizePolicy(sizePolicy)
+
+        self.layoutEstructura5.addWidget(self.usuario, 0, Qt.AlignRight)
+
+        self.labelEstadoConexion = QLabel(self.estadoCabecera)
         self.labelEstadoConexion.setObjectName(u"labelEstadoConexion")
-        self.labelEstadoConexion.setAlignment(Qt.AlignCenter)
+        self.labelEstadoConexion.setProperty(u"uiRole", u"status")
+        self.labelEstadoConexion.setAlignment(Qt.AlignLeft|Qt.AlignVCenter)
+        self.labelEstadoConexion.setWordWrap(False)
+        sizePolicy.setHeightForWidth(self.labelEstadoConexion.sizePolicy().hasHeightForWidth())
+        self.labelEstadoConexion.setSizePolicy(sizePolicy)
 
-        self.verticalLayout_header.addWidget(self.labelEstadoConexion)
+        self.layoutEstructura5.addWidget(self.labelEstadoConexion, 0, Qt.AlignRight)
 
 
-        self.verticalLayout.addWidget(self.frameHeader)
+        self.layoutEstructura2.addWidget(self.estadoCabecera)
 
-        self.rumsaSpacer_empleado = QSpacerItem(20, 10, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
 
-        self.verticalLayout.addItem(self.rumsaSpacer_empleado)
+        self.gridLayout.addWidget(self.frameHeader)
 
-        self.label = QLabel(self.centralwidget)
+        self.areaContenido = QScrollArea(self.centralwidget)
+        self.areaContenido.setObjectName(u"areaContenido")
+        self.areaContenido.setWidgetResizable(True)
+        self.areaContenido.setFrameShape(QFrame.NoFrame)
+        self.panelEmpleado = QFrame()
+        self.panelEmpleado.setObjectName(u"panelEmpleado")
+        self.panelEmpleado.setProperty(u"uiRole", u"card")
+        self.layoutEstructura6 = QVBoxLayout(self.panelEmpleado)
+        self.layoutEstructura6.setSpacing(12)
+        self.layoutEstructura6.setObjectName(u"layoutEstructura6")
+        self.layoutEstructura6.setContentsMargins(16, 16, 16, 16)
+        self.espacioSuperiorEmpleado = QSpacerItem(8, 8, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)
+
+        self.layoutEstructura6.addItem(self.espacioSuperiorEmpleado)
+
+        self.opcionesEmpleado = QWidget(self.panelEmpleado)
+        self.opcionesEmpleado.setObjectName(u"opcionesEmpleado")
+        self.opcionesEmpleado.setMinimumSize(QSize(560, 0))
+        self.opcionesEmpleado.setMaximumSize(QSize(640, 16777215))
+        sizePolicy1 = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        sizePolicy1.setHorizontalStretch(0)
+        sizePolicy1.setVerticalStretch(0)
+        sizePolicy1.setHeightForWidth(self.opcionesEmpleado.sizePolicy().hasHeightForWidth())
+        self.opcionesEmpleado.setSizePolicy(sizePolicy1)
+        self.opcionesEmpleadoLayout = QVBoxLayout(self.opcionesEmpleado)
+        self.opcionesEmpleadoLayout.setSpacing(12)
+        self.opcionesEmpleadoLayout.setObjectName(u"opcionesEmpleadoLayout")
+        self.opcionesEmpleadoLayout.setContentsMargins(0, 0, 0, 0)
+        self.label = QLabel(self.opcionesEmpleado)
         self.label.setObjectName(u"label")
-        self.label.setMaximumSize(QSize(16777215, 16777215))
-        font = QFont()
-        font.setFamilies([u"Arial"])
-        font.setPointSize(18)
-        font.setBold(True)
-        font.setItalic(False)
-        self.label.setFont(font)
-        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setAlignment(Qt.AlignLeft|Qt.AlignVCenter)
+        self.label.setWordWrap(False)
+        sizePolicy.setHeightForWidth(self.label.sizePolicy().hasHeightForWidth())
+        self.label.setSizePolicy(sizePolicy)
+        self.label.setProperty(u"uiRole", u"heading")
 
-        self.verticalLayout.addWidget(self.label)
+        self.opcionesEmpleadoLayout.addWidget(self.label)
 
+        self.labelHeaderInfo = QLabel(self.opcionesEmpleado)
+        self.labelHeaderInfo.setObjectName(u"labelHeaderInfo")
+        self.labelHeaderInfo.setAlignment(Qt.AlignLeft|Qt.AlignVCenter)
+        self.labelHeaderInfo.setWordWrap(False)
+        sizePolicy.setHeightForWidth(self.labelHeaderInfo.sizePolicy().hasHeightForWidth())
+        self.labelHeaderInfo.setSizePolicy(sizePolicy)
+        self.labelHeaderInfo.setProperty(u"uiRole", u"caption")
 
-        self.gridLayout.addLayout(self.verticalLayout, 1, 0, 1, 1)
+        self.opcionesEmpleadoLayout.addWidget(self.labelHeaderInfo)
 
-        self.verticalLayout_4 = QVBoxLayout()
-        self.verticalLayout_4.setObjectName(u"verticalLayout_4")
-
-        self.gridLayout.addLayout(self.verticalLayout_4, 2, 0, 1, 1)
-
-        self.verticalLayout_6 = QVBoxLayout()
-        self.verticalLayout_6.setObjectName(u"verticalLayout_6")
-
-        self.gridLayout.addLayout(self.verticalLayout_6, 3, 0, 1, 1)
-
-        self.verticalLayout_3 = QVBoxLayout()
-        self.verticalLayout_3.setObjectName(u"verticalLayout_3")
-
-        self.gridLayout.addLayout(self.verticalLayout_3, 4, 0, 1, 1)
-
-        self.horizontalLayout = QHBoxLayout()
-        self.horizontalLayout.setObjectName(u"horizontalLayout")
-        self.espacio1 = QSpacerItem(20, 40, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-
-        self.horizontalLayout.addItem(self.espacio1)
-
-        self.botonrecarga = QPushButton(self.centralwidget)
+        self.botonrecarga = QPushButton(self.opcionesEmpleado)
         self.botonrecarga.setObjectName(u"botonrecarga")
-        font1 = QFont()
-        font1.setFamilies([u"Arial"])
-        font1.setPointSize(12)
-        font1.setBold(True)
-        font1.setItalic(False)
-        self.botonrecarga.setFont(font1)
+        sizePolicy.setHeightForWidth(self.botonrecarga.sizePolicy().hasHeightForWidth())
+        self.botonrecarga.setSizePolicy(sizePolicy)
+        self.botonrecarga.setProperty(u"uiRole", u"menuAction")
+        self.botonrecarga.setMinimumSize(QSize(312, 170))
+        self.botonrecarga.setMaximumSize(QSize(312, 190))
+        self.botonrecarga.setProperty(u"menuShape", u"tile")
 
-        self.horizontalLayout.addWidget(self.botonrecarga)
-
-        self.espacio2 = QSpacerItem(20, 40, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-
-        self.horizontalLayout.addItem(self.espacio2)
+        self.opcionesEmpleadoLayout.addWidget(self.botonrecarga, 0, Qt.AlignHCenter)
 
 
-        self.gridLayout.addLayout(self.horizontalLayout, 5, 0, 1, 1)
+        self.layoutEstructura6.addWidget(self.opcionesEmpleado, 0, Qt.AlignHCenter)
 
+        self.espacioEstructura7 = QSpacerItem(8, 8, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)
+
+        self.layoutEstructura6.addItem(self.espacioEstructura7)
+
+        self.layoutEstructura6.setStretch(0, 1)
+        self.layoutEstructura6.setStretch(2, 1)
+        self.areaContenido.setWidget(self.panelEmpleado)
+
+        self.gridLayout.addWidget(self.areaContenido)
+
+        self.pieAplicacion = QLabel(self.centralwidget)
+        self.pieAplicacion.setObjectName(u"pieAplicacion")
+        sizePolicy.setHeightForWidth(self.pieAplicacion.sizePolicy().hasHeightForWidth())
+        self.pieAplicacion.setSizePolicy(sizePolicy)
+        self.pieAplicacion.setProperty(u"uiRole", u"caption")
+        self.pieAplicacion.setAlignment(Qt.AlignCenter)
+
+        self.gridLayout.addWidget(self.pieAplicacion)
+
+        self.gridLayout.setStretch(1, 1)
         EmpleadoWindow.setCentralWidget(self.centralwidget)
 
         self.retranslateUi(EmpleadoWindow)
@@ -286,15 +208,16 @@ class EmpleadoWindow(object):
 
     def retranslateUi(self, EmpleadoWindow):
         EmpleadoWindow.setWindowTitle(QCoreApplication.translate("EmpleadoWindow", u"Empleado", None))
+        self.labelBrand.setText(QCoreApplication.translate("EmpleadoWindow", u"RUMSA", None))
+        self.labelCompany.setText(QCoreApplication.translate("EmpleadoWindow", u"Rutas Urbanas de Matehuala S.A. de C.V.", None))
         self.usuario.setText(QCoreApplication.translate("EmpleadoWindow", u"Usuario", None))
-        self.labelBrand.setText(QCoreApplication.translate("EmpleadoWindow", u"Trasporte", None))
-        self.labelCompany.setText(QCoreApplication.translate("EmpleadoWindow", u"", None))
-        self.labelHeaderInfo.setText(QCoreApplication.translate("EmpleadoWindow", u"Rutas Urbanas de Matehuala", None))
 #if QT_CONFIG(tooltip)
         self.labelEstadoConexion.setToolTip(QCoreApplication.translate("EmpleadoWindow", u"Este texto puede cambiar a: Conectando, Sin conexi\u00f3n, Sincronizando o Conectado.", None))
 #endif // QT_CONFIG(tooltip)
         self.labelEstadoConexion.setText(QCoreApplication.translate("EmpleadoWindow", u"\u25cf Conectando", None))
         self.label.setText(QCoreApplication.translate("EmpleadoWindow", u"Men\u00fa principal", None))
+        self.labelHeaderInfo.setText(QCoreApplication.translate("EmpleadoWindow", u"Rutas Urbanas de Matehuala", None))
         self.botonrecarga.setText(QCoreApplication.translate("EmpleadoWindow", u"Recargar", None))
+        self.pieAplicacion.setText(QCoreApplication.translate("EmpleadoWindow", u"RUMSA - Rutas Urbanas de Matehuala", None))
     # retranslateUi
 

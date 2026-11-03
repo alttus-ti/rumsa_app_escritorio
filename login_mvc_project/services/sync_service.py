@@ -1,248 +1,392 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
-from typing import Any
 
 import requests
 
-from core.database import get_connection
+from core.database import get_connection, DATABASE_DIR
 from core.sync_config import (
     SYNC_API_BASE_URL,
     SYNC_API_TOKEN,
     SYNC_BATCH_PATH,
     SYNC_BATCH_SIZE,
     SYNC_CONNECT_TIMEOUT_SECONDS,
-    SYNC_PING_PATH,
     SYNC_READ_TIMEOUT_SECONDS,
+    SYNC_PING_PATH,
     SYNC_UPLOAD_FOTO_PATH,
 )
 
 
 class SyncService:
-    def __init__(self) -> None:
+    def __init__(self):
         self.base_url = SYNC_API_BASE_URL.rstrip("/")
         self.token = SYNC_API_TOKEN.strip()
-        self.timeout = (SYNC_CONNECT_TIMEOUT_SECONDS, SYNC_READ_TIMEOUT_SECONDS)
+        self.timeout = (
+            SYNC_CONNECT_TIMEOUT_SECONDS,
+            SYNC_READ_TIMEOUT_SECONDS,
+        )
+        self._last_blacklist = 0
 
-    def count_pending(self) -> int:
-        with get_connection() as connection:
-            row = connection.execute(
+    def _headers(self):
+        return {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.token}",
+            "X-Desktop-Sync-Token": self.token,
+        }
+
+    def count_pending(self):
+        with get_connection() as c:
+            return c.execute(
                 """
-                SELECT COUNT(*) AS total
-                FROM sync_queue
-                WHERE status IN ('pending', 'error')
+                SELECT COUNT(*) FROM sync_queue
+                WHERE status IN ('pending', 'error', 'waiting_api')
                 """
-            ).fetchone()
+            ).fetchone()[0]
 
-        return int(row["total"] if row else 0)
-
-    def hay_internet(self) -> bool:
-        try:
-            response = requests.get(
-                "https://www.gstatic.com/generate_204",
-                timeout=3,
-                allow_redirects=False
-            )
-            return response.status_code == 204
-
-        except requests.RequestException:
-            return False
-        
-    def ping(self) -> bool:
-        if not self.hay_internet():
-            print("[SYNC] Sin internet")
-            return False
-        
-        if not self.base_url or not self.token:
-            return False
-
-        response = requests.get(
+    def _ping_data(self):
+        r = requests.get(
             f"{self.base_url}{SYNC_PING_PATH}",
             headers=self._headers(),
             timeout=self.timeout,
         )
-        response.raise_for_status()
-        data = response.json()
-        return bool(data.get("ok", False))
+        r.raise_for_status()
+        return r.json()
 
-    def sync_pending_once(self) -> dict[str, Any]:
-        pending_before = self.count_pending()
-
-        # Verificar internet antes de sincronizar
-        if not self.hay_internet():
-            print(f"[SYNC] Sin internet. Pendientes: {pending_before}")
-
-            return {
-                "state": "offline",
-                "pending_before": pending_before,
-                "pending_after": pending_before,
-                "synced_count": 0,
-                "error_count": 0,
-                "message": "Sin internet",
-            }
-
-        # Solo continuar si hay internet
-        self._cleanup_synced_queue()
-        pending_before = self.count_pending()
-
-        if pending_before == 0:
-            try:
-                online = self.ping()
-                if online:
-                    self.limpiar_tarjetas_locales_ya_subidas()
-                return {
-                    "state": "connected" if online else "offline",
-                    "pending_before": 0,
-                    "pending_after": 0,
-                    "synced_count": 0,
-                    "error_count": 0,
-                    "message": "Sin pendientes" if online else "Sin conexión",
-                }
-            except Exception as error:
-                return {
-                    "state": "offline",
-                    "pending_before": 0,
-                    "pending_after": 0,
-                    "synced_count": 0,
-                    "error_count": 0,
-                    "message": str(error),
-                }
-
-        operations = self._load_pending_operations(limit=SYNC_BATCH_SIZE)
-        if not operations:
-            return {
-                "state": "connected",
-                "pending_before": pending_before,
-                "pending_after": 0,
-                "synced_count": 0,
-                "error_count": 0,
-                "message": "Sin pendientes",
-            }
-            
-        operations = self._preparar_fotos_para_subir(operations)
-
+    def hay_internet(self):
         try:
-            response = requests.post(
-                f"{self.base_url}{SYNC_BATCH_PATH}",
-                json={"operations": operations},
-                headers=self._headers(),
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except Exception as error:
-            return {
-                "state": "offline",
-                "pending_before": pending_before,
-                "pending_after": pending_before,
-                "synced_count": 0,
-                "error_count": len(operations),
-                "message": str(error),
-            }
+            return bool(self._ping_data().get("ok"))
+        except (requests.RequestException, ValueError):
+            return False
 
-        results = payload.get("results", [])
-        synced_count = 0
-        error_count = 0
+    def ping(self):
+        return self.hay_internet()
 
-        for result in results:
-            operation_uuid = (result or {}).get("operation_uuid")
-            status = (result or {}).get("status")
-            message = (result or {}).get("message") or "Error desconocido"
+    def sync_pending_once(self):
+        before = self.count_pending()
+        synced = 0
+        errors = 0
+        message = "Sin pendientes"
+        try:
+            data = self._ping_data()
+            if not isinstance(data, dict) or not data.get("ok"):
+                raise ValueError("La API no confirmo la conexion.")
+            capabilities = data.get("capabilities") or []
+            if not isinstance(capabilities, list):
+                capabilities = []
 
-            if not operation_uuid:
-                continue
+            if time.monotonic() - self._last_blacklist > 300:
+                try:
+                    self._refresh_blacklist()
+                    self._last_blacklist = time.monotonic()
+                except Exception as error:
+                    message = f"Se conserva la lista negra anterior: {error}"
+                    errors += 1
 
-            if status in {"ok", "already_synced", "success"}:
-                self._mark_synced(operation_uuid)
-                synced_count += 1
-            else:
-                self._mark_error(operation_uuid, message)
-                error_count += 1
+            with get_connection() as c:
+                rows = c.execute("""
+                    SELECT * FROM sync_queue
+                    WHERE status IN ('pending', 'error', 'waiting_api')
+                    ORDER BY id
+                """).fetchall()
 
-        pending_after = self.count_pending()
-        eliminadas = 0
-        if pending_after == 0:
-            eliminadas = self.limpiar_tarjetas_locales_ya_subidas()
-
-        return {
-            "state": "connected" if error_count == 0 else "connected_with_errors",
-            "pending_before": pending_before,
-            "pending_after": pending_after,
-            "synced_count": synced_count,
-            "error_count": error_count,
-            "message": "Sincronización completada",
-        }
-
-    def _load_pending_operations(self, *, limit: int) -> list[dict[str, Any]]:
-        with get_connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT operation_uuid, event_type, entity_uid, payload_json
-                FROM sync_queue
-                WHERE status IN ('pending', 'error')
-                ORDER BY id ASC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-
-        operations: list[dict[str, Any]] = []
-        for row in rows:
-            operations.append(
-                {
+            blocked_uids = set()
+            for row in rows:
+                if synced >= SYNC_BATCH_SIZE:
+                    break
+                try:
+                    payload = json.loads(row["payload_json"])
+                    if not isinstance(payload, dict):
+                        raise ValueError("Payload de sincronizacion invalido.")
+                except (ValueError, TypeError) as error:
+                    self._mark_error(row["operation_uuid"], str(error))
+                    blocked_uids.add(str(row["entity_uid"] or "").strip().upper())
+                    errors += 1
+                    message = str(error)
+                    continue
+                operation = {
                     "operation_uuid": row["operation_uuid"],
                     "event_type": row["event_type"],
                     "entity_uid": row["entity_uid"],
-                    "payload": json.loads(row["payload_json"]),
+                    "payload": payload,
                 }
+                uids = self._operation_uids(operation)
+                if uids & blocked_uids:
+                    blocked_uids.update(uids)
+                    continue
+                incompatibilidad = self._compatibility_error(operation, capabilities)
+                if incompatibilidad:
+                    self._mark_waiting_api(operation["operation_uuid"], incompatibilidad)
+                    blocked_uids.update(uids)
+                    errors += 1
+                    message = incompatibilidad
+                    continue
+                try:
+                    self._prepare_photo(operation)
+                except Exception as error:
+                    self._mark_error(operation["operation_uuid"], str(error))
+                    blocked_uids.update(uids)
+                    errors += 1
+                    message = str(error)
+                    continue
+
+                # Una sola operacion por peticion: confirmar antes de continuar.
+                response = requests.post(
+                    f"{self.base_url}{SYNC_BATCH_PATH}",
+                    json={"operations": [operation]},
+                    headers=self._headers(),
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                body = response.json()
+                results = body.get("results", []) if isinstance(body, dict) else []
+                if not isinstance(results, list):
+                    results = []
+                matches = [item for item in results if isinstance(item, dict)
+                           and item.get("operation_uuid") == operation["operation_uuid"]]
+                if len(matches) != 1:
+                    errors += 1
+                    message = "Operacion sin confirmacion unica; se conserva pendiente."
+                    break
+                result = matches[0]
+                if result.get("status") not in {"ok", "already_synced"}:
+                    message = result.get("message") or "Error de sincronizacion."
+                    self._mark_error(operation["operation_uuid"], message)
+                    blocked_uids.update(uids)
+                    errors += 1
+                    continue
+
+                self._mark_synced(operation["operation_uuid"])
+                synced += 1
+
+            self._maintenance()
+            if synced and not errors:
+                message = "Sincronizacion completada"
+            return self._result("connected_with_errors" if errors else "connected",
+                                before, synced, errors, message)
+        except Exception as error:
+            return self._result("offline", before, synced, errors, str(error))
+
+    def _operation_uids(self, operation):
+        payload = operation["payload"]
+        return {str(uid).strip().upper() for uid in (
+            operation.get("entity_uid"), payload.get("uid"),
+            payload.get("uid_anterior"), payload.get("uid_nueva")) if uid}
+
+    def _compatibility_error(self, operation, capabilities):
+        payload = operation["payload"]
+        tipo = str(payload.get("tipo_codigo_local") or "").strip().upper()
+        tipo = {"NORMAL": "NO", "NOR": "NO", "PREFERENCIAL": "EU", "PRE": "EU",
+                "OPERADOR": "KI", "OPE": "KI", "DESPACHADOR": "DE"}.get(tipo, tipo)
+        entidad = payload.get("entidad")
+        if entidad == "despachador":
+            tipo = "DE"
+        elif entidad == "operador" and tipo != "DE":
+            tipo = "KI"
+        if tipo and tipo not in {"NO", "EU", "KI", "DE"}:
+            return "Tipo de tarjeta no compatible; se conserva pendiente."
+        if tipo not in {"KI", "DE"}:
+            with get_connection() as c:
+                for uid in self._operation_uids(operation):
+                    tarjeta = c.execute(
+                        "SELECT tipo_tarjeta FROM v_tarjetas_locales WHERE uid=? LIMIT 1", (uid,)
+                    ).fetchone()
+                    descripcion = str(tarjeta[0] or "").lower() if tarjeta else ""
+                    if descripcion == "de" or "despachador" in descripcion:
+                        tipo = "DE"
+                        break
+                    if descripcion in {"ki", "ope"} or "operador" in descripcion:
+                        tipo = "KI"
+                        break
+        if operation["event_type"] == "recarga_tarjeta" and tipo in {"KI", "DE"}:
+            return "Las tarjetas de operador y despachador no admiten recargas."
+        if tipo == "DE" and "despachadores_offline_v1" not in capabilities:
+            return "La API requiere soporte para DE/despachador; el evento sigue pendiente."
+        if tipo == "KI" and "operadores_offline_v1" not in capabilities:
+            return "La API requiere soporte para KI/operador; el evento sigue pendiente."
+        if (operation["event_type"] == "sustitucion_tarjeta"
+                and "sustituciones_offline_v1" not in capabilities):
+            return "La API requiere soporte para sustituciones; el evento sigue pendiente."
+        if operation["event_type"] not in {
+                "alta_tarjeta", "recarga_tarjeta", "cancelacion_tarjeta", "sustitucion_tarjeta"}:
+            return "Tipo de evento no compatible; se conserva pendiente."
+        return ""
+
+    def _mark_waiting_api(self, operation_uuid, message):
+        with get_connection() as c:
+            c.execute("""
+                UPDATE sync_queue SET status='waiting_api', last_error=?
+                WHERE operation_uuid=?
+            """, (message, operation_uuid))
+
+    def _result(
+        self,
+        state,
+        before,
+        synced,
+        errors,
+        message,
+    ):
+        return {
+            "state": state,
+            "pending_before": before,
+            "pending_after": self.count_pending(),
+            "synced_count": synced,
+            "error_count": errors,
+            "message": message,
+        }
+
+    def _prepare_photo(self, operation):
+        if operation["event_type"] != "alta_tarjeta":
+            return
+
+        payload = operation["payload"]
+        foto = str(payload.get("foto") or "")
+
+        prefijos = (
+            "pasajeros/",
+            "operadores/",
+            "despachadores/",
+            "http://",
+            "https://",
+        )
+
+        if not foto or foto.startswith(prefijos):
+            return
+
+        path = Path(foto)
+
+        if not path.is_file():
+            raise ValueError(
+                "La foto pendiente no está disponible: "
+                f"{path.name}"
             )
 
-        return operations
+        with path.open("rb") as file:
+            r = requests.post(
+                f"{self.base_url}{SYNC_UPLOAD_FOTO_PATH}",
+                headers=self._headers(),
+                data={"uid": payload["uid"]},
+                files={"foto": (path.name, file)},
+                timeout=self.timeout,
+            )
 
-    def _mark_synced(self, operation_uuid: str) -> None:
-        with get_connection() as connection:
-            operation = connection.execute(
+        r.raise_for_status()
+        data = r.json()
+
+        if not data.get("ok") or not data.get("path"):
+            raise ValueError("No se confirmó la foto.")
+
+        payload["foto"] = data["path"]
+
+        with get_connection() as c:
+            c.execute(
+                """
+                UPDATE sync_queue SET payload_json = ?
+                WHERE operation_uuid = ?
+                """,
+                (
+                    json.dumps(payload, ensure_ascii=False),
+                    operation["operation_uuid"],
+                ),
+            )
+
+    def _mark_synced(self, operation_uuid):
+        prefijos = (
+            "pasajeros/",
+            "operadores/",
+            "despachadores/",
+            "http://",
+            "https://",
+        )
+
+        with get_connection() as c:
+            row = c.execute(
                 """
                 SELECT event_type, entity_uid, payload_json
                 FROM sync_queue
                 WHERE operation_uuid = ?
-                LIMIT 1
                 """,
                 (operation_uuid,),
             ).fetchone()
 
-            connection.execute(
-                """
-                UPDATE sync_queue
-                SET status = 'synced',
-                    synced_at = datetime('now'),
-                    last_error = NULL
-                WHERE operation_uuid = ?
-                """,
-                (operation_uuid,),
-            )
-
-            if operation:
-                self._cleanup_synced_local_data(
-                    connection=connection,
-                    event_type=operation["event_type"],
-                    entity_uid=operation["entity_uid"],
-                    payload=json.loads(operation["payload_json"]),
+            if row and row["event_type"] == "alta_tarjeta":
+                remote = str(
+                    json.loads(row["payload_json"]).get("foto")
+                    or ""
                 )
 
-            connection.execute(
+                if remote.startswith(prefijos):
+                    titulares = (
+                        (
+                            "pasajeros",
+                            "id IN (SELECT pasajero_id "
+                            "FROM tarjetas WHERE uid = ?)",
+                        ),
+                        (
+                            "operadores",
+                            "tarjeta_id IN (SELECT id "
+                            "FROM tarjetas WHERE uid = ?)",
+                        ),
+                        (
+                            "despachadores",
+                            "tarjeta_id IN (SELECT id "
+                            "FROM tarjetas WHERE uid = ?)",
+                        ),
+                    )
+
+                    for table, condition in titulares:
+                        old = c.execute(
+                            f"SELECT foto FROM {table} "
+                            f"WHERE {condition}",
+                            (row["entity_uid"],),
+                        ).fetchall()
+
+                        for foto in old:
+                            local = str(foto[0] or "")
+
+                            if (
+                                local
+                                and not local.startswith(prefijos)
+                            ):
+                                c.execute(
+                                    """
+                                    INSERT OR REPLACE
+                                    INTO uploaded_photos
+                                    VALUES (?, ?)
+                                    """,
+                                    (local, remote),
+                                )
+
+                        c.execute(
+                            f"UPDATE {table} SET foto = ? "
+                            f"WHERE {condition}",
+                            (remote, row["entity_uid"]),
+                        )
+
+            for table in ("recargas", "sustituciones"):
+                c.execute(
+                    f"""
+                    UPDATE {table}
+                    SET sincronizada = 1,
+                        synced_at = datetime('now')
+                    WHERE sync_uuid = ?
+                    """,
+                    (operation_uuid,),
+                )
+
+            c.execute(
                 """
                 DELETE FROM sync_queue
                 WHERE operation_uuid = ?
-                  AND status = 'synced'
                 """,
                 (operation_uuid,),
             )
 
-    def _mark_error(self, operation_uuid: str, message: str) -> None:
-        with get_connection() as connection:
-            connection.execute(
+    def _mark_error(self, operation_uuid, message):
+        with get_connection() as c:
+            c.execute(
                 """
                 UPDATE sync_queue
                 SET status = 'error',
@@ -250,318 +394,128 @@ class SyncService:
                     last_error = ?
                 WHERE operation_uuid = ?
                 """,
-                (message[:1000], operation_uuid),
+                (str(message)[:1000], operation_uuid),
             )
 
-    def _cleanup_synced_queue(self) -> None:
-        with get_connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT operation_uuid, event_type, entity_uid, payload_json
-                FROM sync_queue
-                WHERE status = 'synced'
-                ORDER BY id ASC
-                """
-            ).fetchall()
+    def _refresh_blacklist(self):
+        after = 0
 
-            for row in rows:
-                self._cleanup_synced_local_data(
-                    connection=connection,
-                    event_type=row["event_type"],
-                    entity_uid=row["entity_uid"],
-                    payload=json.loads(row["payload_json"]),
-                )
+        with get_connection() as c:
+            c.execute("DELETE FROM blacklist_stage")
 
-                connection.execute(
-                    """
-                    DELETE FROM sync_queue
-                    WHERE operation_uuid = ?
-                      AND status = 'synced'
-                    """,
-                    (row["operation_uuid"],),
-                )
-
-    def _headers(self) -> dict[str, str]:
-        return {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {self.token}",
-            "X-Desktop-Sync-Token": self.token,
-        }
-        
-    def _preparar_fotos_para_subir(self, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        for operation in operations:
-            if operation.get("event_type") != "alta_tarjeta":
-                continue
-
-            payload = operation.get("payload") or {}
-
-            foto = str(payload.get("foto") or "").strip()
-
-            if not foto:
-                continue
-
-            # Si ya es ruta del servidor, no la vuelvas a subir
-            if foto.startswith("pasajeros/") or foto.startswith("http://") or foto.startswith("https://"):
-                continue
-
-            foto_path = Path(foto)
-
-            if not foto_path.exists():
-                payload["foto"] = ""
-                self._actualizar_payload_local(operation["operation_uuid"], payload)
-                continue
-
-            resultado = self._subir_foto_al_servidor(
-                foto_path=foto_path,
-                uid=str(payload.get("uid") or operation.get("entity_uid") or "")
-            )
-
-            payload["foto"] = resultado["path"]
-
-            operation["payload"] = payload
-
-            self._actualizar_payload_local(operation["operation_uuid"], payload)
-
-        return operations
-
-
-    def _subir_foto_al_servidor(self, *, foto_path: Path, uid: str) -> dict[str, Any]:
-        with foto_path.open("rb") as archivo:
-            response = requests.post(
-                f"{self.base_url}{SYNC_UPLOAD_FOTO_PATH}",
+        while True:
+            r = requests.get(
+                f"{self.base_url}/api/desktop-sync/blacklist",
+                params={"after_id": after},
                 headers=self._headers(),
-                data={
-                    "uid": uid,
-                },
-                files={
-                    "foto": (foto_path.name, archivo),
-                },
                 timeout=self.timeout,
             )
 
-        response.raise_for_status()
+            r.raise_for_status()
+            data = r.json()
 
-        data = response.json()
+            if (
+                not data.get("ok")
+                or not isinstance(data.get("items"), list)
+                or 'next_after_id' not in data
+            ):
+                raise ValueError(
+                    "Respuesta de lista negra incompleta."
+                )
 
-        if not data.get("ok") or not data.get("path"):
-            raise RuntimeError("El servidor no devolvió la ruta de la foto.")
+            with get_connection() as c:
+                for row in data["items"]:
+                    uid = str(row["uid"]).strip().upper()
 
-        return data
+                    if not uid:
+                        raise ValueError(
+                            "UID vacía en lista negra."
+                        )
 
+                    c.execute(
+                        """
+                        INSERT OR REPLACE INTO blacklist_stage (
+                            uid, motivo, fecha_baja
+                        )
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            uid,
+                            str(
+                                row.get("motivo_baja") or ""
+                            )[:250],
+                            row.get("fecha_baja"),
+                        ),
+                    )
 
-    def _actualizar_payload_local(self, operation_uuid: str, payload: dict[str, Any]) -> None:
-        with get_connection() as connection:
-            connection.execute(
+            next_after = data.get("next_after_id")
+
+            if next_after is None:
+                break
+
+            if int(next_after) <= after:
+                raise ValueError(
+                    "Paginación de lista negra inválida."
+                )
+
+            after = int(next_after)
+
+        with get_connection() as c:
+            c.execute("DELETE FROM lista_negra")
+
+            c.execute(
                 """
-                UPDATE sync_queue
-                SET payload_json = ?
-                WHERE operation_uuid = ?
-                """,
-                (
-                    json.dumps(payload, ensure_ascii=False),
-                    operation_uuid,
+                INSERT INTO lista_negra
+                SELECT uid, motivo, fecha_baja
+                FROM blacklist_stage
+                """
+            )
+
+            c.execute("DELETE FROM blacklist_stage")
+
+            c.execute(
+                """
+                INSERT OR REPLACE INTO local_settings
+                VALUES (
+                    'blacklist_updated_at',
+                    datetime('now')
+                )
+                """
+            )
+
+            c.execute(
+                """
+                UPDATE tarjetas
+                SET en_lista_negra = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM lista_negra b
+                        WHERE b.uid = tarjetas.uid
+                    )
+                    THEN 1
+                    ELSE 0
+                END,
+                motivo_baja = (
+                    SELECT motivo FROM lista_negra b
+                    WHERE b.uid = tarjetas.uid
                 ),
-            )
-
-
-    def _cleanup_synced_local_data(
-        self,
-        *,
-        connection,
-        event_type: str,
-        entity_uid: str | None,
-        payload: dict[str, Any],
-    ) -> None:
-        uid = str(entity_uid or payload.get("uid") or "").strip().upper()
-        if not uid:
-            return
-
-        if self._has_unsynced_operations_for_uid(connection, uid):
-            return
-
-        if event_type in {
-            "alta_tarjeta",
-            "recarga_tarjeta",
-            "cancelacion_tarjeta",
-            "sustitucion_tarjeta",
-        }:
-            self._delete_local_card_data(connection, uid)
-
-
-    def _has_unsynced_operations_for_uid(self, connection, uid: str) -> bool:
-        row = connection.execute(
-            """
-            SELECT 1
-            FROM sync_queue
-            WHERE UPPER(COALESCE(entity_uid, '')) = ?
-              AND status IN ('pending', 'error')
-            LIMIT 1
-            """,
-            (uid,),
-        ).fetchone()
-
-        return row is not None
-
-
-    def _delete_local_card_data(self, connection, uid: str) -> None:
-        tarjetas = connection.execute(
-            """
-            SELECT id, pasajero_id
-            FROM tarjetas
-            WHERE UPPER(uid) = ?
-            """,
-            (uid,),
-        ).fetchall()
-
-        for tarjeta in tarjetas:
-            tarjeta_id = tarjeta["id"]
-            pasajero_id = tarjeta["pasajero_id"]
-
-            connection.execute(
-                """
-                DELETE FROM recargas
-                WHERE tarjeta_id = ?
-                """,
-                (tarjeta_id,),
-            )
-
-            connection.execute(
-                """
-                DELETE FROM tarjetas
-                WHERE id = ?
-                """,
-                (tarjeta_id,),
-            )
-
-            if pasajero_id:
-                self._delete_orphan_passenger(connection, pasajero_id)
-
-
-    def _delete_orphan_passenger(self, connection, pasajero_id: int) -> None:
-        row = connection.execute(
-            """
-            SELECT 1
-            FROM tarjetas
-            WHERE pasajero_id = ?
-            LIMIT 1
-            """,
-            (pasajero_id,),
-        ).fetchone()
-
-        if row is not None:
-            return
-
-        connection.execute(
-            """
-            DELETE FROM pasajeros
-            WHERE id = ?
-            """,
-            (pasajero_id,),
-        )
-        
-    def limpiar_tarjetas_locales_ya_subidas(self) -> int:
-        """
-        Borra de SQLite las tarjetas, recargas y pasajeros que ya existen en el servidor.
-        Solo borra si:
-        1. No hay pendientes/error de esa UID en sync_queue.
-        2. La UID ya existe en el servidor.
-        """
-        eliminadas = 0
-        hubo_error_verificacion = False
-
-        with get_connection() as connection:
-            tarjetas = connection.execute(
-                """
-                SELECT DISTINCT uid
-                FROM tarjetas
-                WHERE uid IS NOT NULL
-                AND TRIM(uid) != ''
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM sync_queue sq
-                    WHERE UPPER(COALESCE(sq.entity_uid, '')) = UPPER(tarjetas.uid)
-                        AND sq.status IN ('pending', 'error')
+                fecha_baja = (
+                    SELECT fecha_baja FROM lista_negra b
+                    WHERE b.uid = tarjetas.uid
+                )
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM sync_queue q
+                    WHERE q.entity_uid = tarjetas.uid
+                      AND q.status IN (
+                          'pending', 'error', 'waiting_api'
+                      )
                 )
                 """
-            ).fetchall()
-
-            for tarjeta in tarjetas:
-                uid = str(tarjeta["uid"] or "").strip().upper()
-
-                if not uid:
-                    continue
-
-                existe_en_servidor = self._tarjeta_existe_en_servidor(uid)
-
-                #if existe_en_servidor is True:
-                    #print(f"[SYNC] UID encontrada en servidor, borrando local: {uid}")
-                 #   self._delete_local_card_data(connection, uid)
-                 #   eliminadas += 1
-                #elif existe_en_servidor is False:
-                    #print(f"[SYNC] UID no encontrada en servidor, se conserva local: {uid}")
-                #else:
-                  #  hubo_error_verificacion = True
-                    #print(f"[SYNC] No se pudo verificar UID, se conserva local: {uid}")
-
-            if not hubo_error_verificacion:
-                self._delete_all_orphan_passengers(connection)
-
-        return eliminadas
-
-
-    def _tarjeta_existe_en_servidor(self, uid: str) -> bool | None:
-        uid = (uid or "").strip().upper()
-
-        if not uid:
-            return False
-
-        if not self.base_url or not self.token:
-            return None
-
-        try:
-            response = requests.get(
-                f"{self.base_url}/api/tarjetas/buscar",
-                params={
-                    "texto": uid,
-                    "limite": 10,
-                    "incluir_lista_negra": 1,
-                },
-                headers=self._headers(),
-                timeout=self.timeout,
             )
 
-            response.raise_for_status()
-            data = response.json()
+    def _maintenance(self):
+        # Solo consolidar el WAL; conservar todo el historial y las fotos.
+        with get_connection() as c:
+            c.execute("PRAGMA wal_checkpoint(PASSIVE)")
 
-            items = data.get("items", [])
-
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-
-                uid_servidor = str(item.get("uid") or "").strip().upper()
-
-                if uid_servidor == uid:
-                    return True
-
-            return False
-
-        except Exception as error:
-            print(f"[SYNC] No se pudo verificar UID en servidor {uid}: {error}")
-            return None
-
-
-    def _delete_all_orphan_passengers(self, connection) -> None:
-        """
-        Borra pasajeros que ya no tienen tarjeta relacionada.
-        """
-        connection.execute(
-            """
-            DELETE FROM pasajeros
-            WHERE id NOT IN (
-                SELECT pasajero_id
-                FROM tarjetas
-                WHERE pasajero_id IS NOT NULL
-            )
-            """
-        )
+    def limpiar_tarjetas_locales_ya_subidas(self):
+        return 0

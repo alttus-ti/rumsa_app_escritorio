@@ -1,4 +1,5 @@
 from datetime import datetime
+from core.lista_negra_local import bloqueo_local
 
 import requests
 
@@ -30,6 +31,12 @@ class CancelarModel:
         if not uid:
             return None
 
+        local = self._obtener_tarjeta_local_por_uid(uid)
+        if local:
+            return local
+        bloqueo = bloqueo_local(uid)
+        if bloqueo:
+            return bloqueo
         tarjeta_servidor = self._obtener_tarjeta_servidor_por_uid(uid)
         if tarjeta_servidor:
             return tarjeta_servidor
@@ -40,19 +47,8 @@ class CancelarModel:
         with get_connection() as connection:
             tarjeta = connection.execute(
                 """
-                SELECT
-                    t.id,
-                    t.uid,
-                    t.saldo,
-                    t.vigencia,
-                    t.en_lista_negra,
-                    t.motivo_baja,
-                    t.fecha_baja,
-                    t.pasajero_id,
-                    p.nombre AS nombre_pasajero
-                FROM tarjetas t
-                LEFT JOIN pasajeros p ON p.id = t.pasajero_id
-                WHERE t.uid = ?
+                SELECT * FROM v_tarjetas_locales
+                WHERE uid = ?
                 LIMIT 1
                 """,
                 (uid,),
@@ -106,6 +102,12 @@ class CancelarModel:
             texto = str(value or "").strip().lower()
             return texto in {"1", "true", "si", "yes", "y"}
 
+        tipo_tarjeta = str(
+            primero("tipo_tarjeta", "tipo", "tipo_descripcion", "tipo_codigo_local", default="")
+        ).strip()
+        if tipo_tarjeta.upper() == "DE" or "despachador" in tipo_tarjeta.lower():
+            tipo_tarjeta = "Despachador"
+
         return {
             "id": None,
             "uid": str(primero("uid", default="")).strip().upper(),
@@ -119,6 +121,7 @@ class CancelarModel:
             ).strip(),
             "fecha_baja": primero("fecha_baja", default=None),
             "pasajero_id": None,
+            "tipo_tarjeta": tipo_tarjeta,
             "nombre_pasajero": str(
                 primero("nombre_pasajero", "nombre", "pasajero", default="")
             ).strip(),
@@ -130,6 +133,7 @@ class CancelarModel:
         uid: str,
         nombre_pasajero: str = "",
         saldo_actual: float = 0.0,
+        tipo_codigo_local: str = "",
     ):
         tarjeta = connection.execute(
             """
@@ -141,59 +145,89 @@ class CancelarModel:
             (uid,),
         ).fetchone()
 
-        nombre_final = (nombre_pasajero or "").strip()
-        if not nombre_final:
-            nombre_final = f"Tarjeta {uid[-4:]}"
+        nombre_final = (
+            (nombre_pasajero or "").strip()
+            or f"Tarjeta {uid[-4:]}"
+        )
 
         if tarjeta:
-            # Si ya existe, actualiza nombre y saldo local
-            if tarjeta["pasajero_id"] and nombre_pasajero.strip():
+            if (
+                tarjeta["pasajero_id"]
+                and nombre_pasajero.strip()
+            ):
                 connection.execute(
                     """
-                    UPDATE pasajeros
-                    SET nombre = ?
+                    UPDATE pasajeros SET nombre = ?
                     WHERE id = ?
                     """,
                     (nombre_final, tarjeta["pasajero_id"]),
                 )
 
-            connection.execute(
-                """
-                UPDATE tarjetas
-                SET saldo = COALESCE(?, saldo)
-                WHERE id = ?
-                """,
-                (saldo_actual, tarjeta["id"]),
-            )
+            if nombre_pasajero.strip():
+                for tabla in ("operadores", "despachadores"):
+                    connection.execute(
+                        f"UPDATE {tabla} SET nombre = ? WHERE tarjeta_id = ?",
+                        (nombre_final, tarjeta["id"]),
+                    )
+
             return tarjeta["id"]
 
-        # Si no existe, crear pasajero + tarjeta
-        documento_auto = "-"
+        if tipo_codigo_local not in {"KI", "NO", "EU", "DE"}:
+            raise ValueError(
+                "Lee de nuevo la tarjeta para identificar "
+                "su tipo antes de cancelarla."
+            )
 
-        cursor_pasajero = connection.execute(
-            """
-            INSERT INTO pasajeros (nombre, documento)
-            VALUES (?, ?)
-            """,
-            (nombre_final, documento_auto),
-        )
-        pasajero_id = cursor_pasajero.lastrowid
+        clave = {
+            "KI": "operador",
+            "EU": "preferencial",
+            "DE": "despachador",
+        }.get(tipo_codigo_local, "normal")
 
-        cursor_tarjeta = connection.execute(
+        tipo_id = connection.execute(
+            "SELECT id FROM tipo_tarjetas WHERE clave = ?",
+            (clave,),
+        ).fetchone()[0]
+
+        pasajero_id = None
+
+        if tipo_codigo_local not in ("KI", "DE"):
+            pasajero_id = connection.execute(
+                """
+                INSERT INTO pasajeros(nombre, documento)
+                VALUES (?, '-')
+                """,
+                (nombre_final,),
+            ).lastrowid
+
+        tarjeta_id = connection.execute(
             """
-            INSERT INTO tarjetas (uid, saldo, tipo_tarjeta_id, pasajero_id, vigencia, en_lista_negra)
-            VALUES (?, ?, ?, ?, ?, 0)
+            INSERT INTO tarjetas (
+                uid, saldo, tipo_tarjeta_id,
+                pasajero_id, vigencia, en_lista_negra
+            )
+            VALUES (?, ?, ?, ?, NULL, 0)
             """,
             (
                 uid,
                 float(saldo_actual or 0),
-                1,          # Normal por defecto
+                tipo_id,
                 pasajero_id,
-                None,
             ),
-        )
-        return cursor_tarjeta.lastrowid
+        ).lastrowid
 
+        if tipo_codigo_local in ("KI", "DE"):
+            tabla = "despachadores" if tipo_codigo_local == "DE" else "operadores"
+            connection.execute(
+                f"""
+                INSERT INTO {tabla}(tarjeta_id, nombre)
+                VALUES (?, ?)
+                """,
+                (tarjeta_id, nombre_final),
+            )
+
+        return tarjeta_id
+    
     def guardar_lectura_si_no_existe(
         self,
         uid: str,
@@ -215,17 +249,30 @@ class CancelarModel:
         saldo_actual: float = 0.0,
         en_lista_negra: bool = True,
         motivo_baja: str = "Cancelada",
+        tipo_codigo_local: str = "",
     ):
+        uid = (uid or "").strip().upper()
+        tipo_codigo_local = (tipo_codigo_local or "").strip().upper()
+
         with get_connection() as connection:
+            connection.execute('BEGIN IMMEDIATE')
             tarjeta_id = self._asegurar_tarjeta_local(
                 connection=connection,
                 uid=uid,
                 nombre_pasajero=nombre_pasajero,
                 saldo_actual=saldo_actual,
+                tipo_codigo_local=tipo_codigo_local,
             )
 
-            fecha_baja = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if en_lista_negra else None
-            motivo_final = motivo_baja if en_lista_negra else None
+            fecha_baja = (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if en_lista_negra
+                else None
+            )
+
+            motivo_final = (
+                motivo_baja if en_lista_negra else None
+            )
 
             connection.execute(
                 """
@@ -236,7 +283,7 @@ class CancelarModel:
                 WHERE id = ?
                 """,
                 (
-                    1 if en_lista_negra else 0,
+                    int(en_lista_negra),
                     motivo_final,
                     fecha_baja,
                     tarjeta_id,
@@ -249,7 +296,9 @@ class CancelarModel:
                 entity_uid=uid,
                 payload={
                     "uid": uid,
-                    "nombre_pasajero": (nombre_pasajero or "").strip(),
+                    "nombre_pasajero": (
+                        nombre_pasajero or ""
+                    ).strip(),
                     "saldo_actual": float(saldo_actual or 0),
                     "en_lista_negra": bool(en_lista_negra),
                     "motivo_baja": motivo_final,

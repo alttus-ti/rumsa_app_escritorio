@@ -3,6 +3,7 @@ from pathlib import Path
 from PySide6.QtCore import QFile, QIODevice
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import QWidget
+from core.imagen_marca import ImagenMarca
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -20,6 +21,7 @@ def load_ui(relative_path: str) -> QWidget:
         raise RuntimeError(f"No se pudo abrir el archivo UI: {ui_path}")
 
     loader = QUiLoader()
+    loader.registerCustomWidget(ImagenMarca)
     window = loader.load(ui_file)
     ui_file.close()
 
