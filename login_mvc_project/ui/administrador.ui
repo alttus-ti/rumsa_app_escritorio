@@ -439,7 +439,7 @@
               <item>
                <widget class="QLabel" name="menu_3">
                 <property name="text">
-                 <string>Menú Personal Operativo</string>
+                 <string>Menú Personal</string>
                 </property>
                 <property name="alignment">
                  <set>Qt::AlignLeft|Qt::AlignVCenter</set>

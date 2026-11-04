@@ -76,7 +76,7 @@ class SyncService:
             if not isinstance(capabilities, list):
                 capabilities = []
 
-            if time.monotonic() - self._last_blacklist > 300:
+            if False:  # Temporal: omitir descarga de lista negra
                 try:
                     self._refresh_blacklist()
                     self._last_blacklist = time.monotonic()

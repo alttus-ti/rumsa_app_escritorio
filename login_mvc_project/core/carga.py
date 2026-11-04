@@ -3,7 +3,7 @@ from contextlib import contextmanager
 
 
 @contextmanager
-def cargando(ventana, mensaje, pendiente=None):
+def cargando(ventana, mensaje, pendiente=None, *, mantener_cargando=False):
     # Permite usar los modelos y validar el controlador sin interfaz gráfica.
     if ventana is None:
         yield
@@ -70,6 +70,8 @@ def cargando(ventana, mensaje, pendiente=None):
             cerrar()
 
     def espera_prolongada():
+        if mantener_cargando:
+            return
         titulo.setText("Esperando confirmación…")
         detalle.setText(
             "La operación sigue pendiente. Puedes ocultar este aviso "

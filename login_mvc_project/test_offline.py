@@ -260,7 +260,8 @@ class OfflineTest(unittest.TestCase):
         tree = ast.parse(source)
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'AppController')
         names = {'_continuar_sustitucion_con_saldo', '_procesar_saldo_para_sustitucion',
-                 '_verificar_saldo_sustitucion', '_finalizar_sustitucion_local', '_guardar_sustitucion_confirmada'}
+                 '_verificar_saldo_sustitucion', '_finalizar_sustitucion_local', '_guardar_sustitucion_confirmada',
+                 '_procesar_confirmacion_saldo_sustitucion'}
         methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
         self.assertEqual(len(methods), len(names))
         module = ast.Module(body=[ast.ClassDef(name='Controller', bases=[], keywords=[], body=methods, decorator_list=[])], type_ignores=[])
@@ -272,6 +273,7 @@ class OfflineTest(unittest.TestCase):
         controller.sustituir_model = SustituirModel()
         controller._sincronizar_pendientes = Mock()
         controller._limpiar_formulario_sustituir = Mock()
+        controller._normalizar_uid = lambda uid: uid.strip().upper()
         self.alta()
         RecargaModel().guardar_recarga_flexible('AABBCCDD', 'prueba', 25, 25)
         datos = self.filas('SELECT * FROM v_tarjetas_locales')[0]
@@ -280,13 +282,30 @@ class OfflineTest(unittest.TestCase):
             datos_original=datos, saldo_objetivo_centavos=2500, fase='esperando_nombre')
         controller._continuar_sustitucion_con_saldo()
         self.assertFalse(self.filas('SELECT * FROM sustituciones'))
+        controller._procesar_saldo_para_sustitucion(5423)
+        controller.arduino.enviar_linea.assert_not_called()
+        self.assertFalse(self.filas('SELECT * FROM sustituciones'))
+        avisar = namespace['QTimer'].singleShot.call_args.args[1]
+        avisar()
+        mensaje = namespace['QMessageBox'].warning.call_args.args[2]
+        self.assertIn('$54.23', mensaje)
+        self.assertIn('$25.00', mensaje)
         controller._procesar_saldo_para_sustitucion(0)
         controller.arduino.enviar_linea.assert_called_once_with('rc,AABBCCEE,2500')
         controller._verificar_saldo_sustitucion()
         controller._procesar_saldo_para_sustitucion(0)
         controller.arduino.enviar_linea.assert_called_once()
         self.assertFalse(self.filas('SELECT * FROM sustituciones'))
-        controller._procesar_saldo_para_sustitucion(2500)
+        for trama in ('ok,AABBCCFF,2500,123', 'ok,AABBCCEE,0,123',
+                      'ok,AABBCCEE,invalido,123', 'ok,AABBCCEE'):
+            controller._procesar_confirmacion_saldo_sustitucion(trama)
+        self.assertFalse(self.filas('SELECT * FROM sustituciones'))
+        controller._procesar_confirmacion_saldo_sustitucion('ok,AABBCCEE,2500,123')
+        self.assertEqual(len(self.filas('SELECT * FROM sustituciones')), 1)
+        pendientes = self.filas("SELECT * FROM sync_queue WHERE event_type='sustitucion_tarjeta'")
+        self.assertEqual(len(pendientes), 1)
+        self.assertEqual(pendientes[0]['status'], 'pending')
+        controller._procesar_confirmacion_saldo_sustitucion('ok,AABBCCEE,2500,123')
         self.assertEqual(len(self.filas('SELECT * FROM sustituciones')), 1)
         self.assertEqual(self.filas("SELECT * FROM v_tarjetas_locales WHERE uid='AABBCCEE'")[0]['nombre_pasajero'], 'Nombre original á')
         self.alta('11223344', 'KI')

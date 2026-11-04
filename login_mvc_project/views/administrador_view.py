@@ -426,7 +426,7 @@ class AdminWindow(object):
         self.labelEstadoConexion.setText(QCoreApplication.translate("AdminWindow", u"\u25cf Conectando", None))
         self.botonusuario.setText(QCoreApplication.translate("AdminWindow", u"Pasajeros", None))
         self.pushButton.setText(QCoreApplication.translate("AdminWindow", u"Personal", None))
-        self.menu_3.setText(QCoreApplication.translate("AdminWindow", u"Men\u00fa Personal Operativo", None))
+        self.menu_3.setText(QCoreApplication.translate("AdminWindow", u"Men\u00fa Personal", None))
         self.labelHeaderInfo_3.setText(QCoreApplication.translate("AdminWindow", u"Selecciona una Opci\u00f3n", None))
         self.botonalta_2.setText(QCoreApplication.translate("AdminWindow", u"Alta >", None))
         self.botonsustituir_2.setText(QCoreApplication.translate("AdminWindow", u"Sustituir >", None))

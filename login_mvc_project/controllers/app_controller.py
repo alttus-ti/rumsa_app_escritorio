@@ -2937,13 +2937,7 @@ class AppController:
                         self._continuar_sustitucion_con_saldo()
 
                 elif linea_minusculas.startswith('ok,'):
-                    pendiente = self.sustituir_pendiente
-                    partes = linea.split(',')
-                    if (pendiente and pendiente.get('fase') == 'verificando_saldo'
-                            and len(partes) >= 4
-                            and self._normalizar_uid(partes[1]) == pendiente['uid_nueva']):
-                        # La respuesta de escritura no sustituye la lectura física.
-                        self._verificar_saldo_sustitucion(pendiente)
+                    self._procesar_confirmacion_saldo_sustitucion(linea)
 
                 elif linea_minusculas.startswith('error'):
 
@@ -3044,8 +3038,11 @@ class AppController:
             return
 
         from core.carga import cargando
-        with cargando(self.current_window, "Guardando sustitución de tarjeta…",
-                      pendiente=lambda: self.sustituir_pendiente is not None):
+        with cargando(self.current_window,
+                      "Comprobando la tarjeta y guardando la sustitución… "
+                      "Si el lector no la detecta, retira y acerca la tarjeta nueva.",
+                      pendiente=lambda: self.sustituir_pendiente is not None,
+                      mantener_cargando=True):
             if self.sustituir_pendiente:
                 self._verificar_saldo_sustitucion(self.sustituir_pendiente)
                 return
@@ -3219,6 +3216,11 @@ class AppController:
         if not pendiente:
             return
         objetivo = pendiente['saldo_objetivo_centavos']
+        pendiente['saldo_leido_centavos'] = saldo_centavos
+        print(
+            f"[SUSTITUIR] Saldo UID={pendiente['uid_nueva']}: "
+            f"leido={saldo_centavos} objetivo={objetivo} centavos"
+        )
         if saldo_centavos == objetivo:
             pendiente['saldo_verificado'] = True
             self._finalizar_sustitucion_local()
@@ -3236,6 +3238,24 @@ class AppController:
         )
         QTimer.singleShot(1500, lambda p=pendiente: self._verificar_saldo_sustitucion(p))
 
+    def _procesar_confirmacion_saldo_sustitucion(self, linea: str) -> None:
+        pendiente = self.sustituir_pendiente
+        if (not pendiente or pendiente.get('fase') != 'verificando_saldo'
+                or not pendiente.get('escritura_saldo_enviada')):
+            return
+        partes = linea.split(',')
+        if (len(partes) < 4 or partes[0].strip().lower() != 'ok'
+                or self._normalizar_uid(partes[1]) != pendiente['uid_nueva']):
+            return
+        try:
+            saldo = int(partes[2])
+        except ValueError:
+            return
+        # Mismo acuse de saldo final que utiliza el módulo de recargas.
+        # Solo confirmar la escritura enviada para esta UID y este objetivo.
+        if saldo == pendiente['saldo_objetivo_centavos']:
+            self._procesar_saldo_para_sustitucion(saldo)
+
     def _verificar_saldo_sustitucion(self, pendiente=None) -> None:
         pendiente = pendiente or self.sustituir_pendiente
         if not pendiente or self.sustituir_pendiente is not pendiente:
@@ -3251,13 +3271,21 @@ class AppController:
             pendiente['aviso_verificacion_programado'] = True
             def avisar():
                 if self.sustituir_pendiente is pendiente:
-                    QMessageBox.warning(
-                        self.current_window, 'Sustituir',
-                        'Sustitución pendiente de comprobar el saldo o guardar en SQLite. '
-                        'Retira y acerca la tarjeta nueva para leer su saldo. '
-                        'No repitas el alta ni la recarga. No cierres la aplicación: '
-                        'la escritura física y SQLite no forman una transacción única.'
-                    )
+                    saldo_leido = pendiente.get('saldo_leido_centavos')
+                    objetivo = pendiente['saldo_objetivo_centavos']
+                    if (saldo_leido is not None and saldo_leido > objetivo
+                            and not pendiente.get('escritura_saldo_enviada')):
+                        QMessageBox.warning(
+                            self.current_window, 'Sustituir',
+                            f'La tarjeta nueva tiene ${saldo_leido / 100:.2f}, '
+                            f'pero el saldo a transferir de la anterior es ${objetivo / 100:.2f}. '
+                            'No se ha descontado saldo ni guardado la sustitución. '
+                            'La preparación de la tarjeta nueva ya fue confirmada por el lector. '
+                            'Revisa los saldos antes de continuar. Este bloqueo no depende de internet.'
+                        )
+                        return
+                    # La demora no es un error: mantener el aviso de carga
+                    # hasta recibir una confirmación o un fallo concreto.
             QTimer.singleShot(8000, avisar)
 
     def _finalizar_sustitucion_local(self) -> None:
